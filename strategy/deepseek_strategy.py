@@ -103,6 +103,15 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
         {"profit_pct": 0.02, "position_pct": 0.5},
         {"profit_pct": 0.04, "position_pct": 0.5},
     )
+    
+    # Telegram Notifications
+    enable_telegram: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_notify_signals: bool = True
+    telegram_notify_fills: bool = True
+    telegram_notify_positions: bool = True
+    telegram_notify_errors: bool = True
 
     # Execution
     position_adjustment_threshold: float = 0.001
@@ -232,6 +241,40 @@ class DeepSeekAIStrategy(Strategy):
             temperature=config.deepseek_temperature,
             max_retries=config.deepseek_max_retries,
         )
+        
+        # Telegram Bot
+        self.telegram_bot = None
+        self.enable_telegram = config.enable_telegram
+        if self.enable_telegram:
+            try:
+                from utils.telegram_bot import TelegramBot
+                
+                bot_token = config.telegram_bot_token or os.getenv('TELEGRAM_BOT_TOKEN', '')
+                chat_id = config.telegram_chat_id or os.getenv('TELEGRAM_CHAT_ID', '')
+                
+                if bot_token and chat_id:
+                    self.telegram_bot = TelegramBot(
+                        token=bot_token,
+                        chat_id=chat_id,
+                        logger=self.log,
+                        enabled=True
+                    )
+                    # Store notification preferences
+                    self.telegram_notify_signals = config.telegram_notify_signals
+                    self.telegram_notify_fills = config.telegram_notify_fills
+                    self.telegram_notify_positions = config.telegram_notify_positions
+                    self.telegram_notify_errors = config.telegram_notify_errors
+                    
+                    self.log.info("✅ Telegram Bot initialized successfully")
+                else:
+                    self.log.warning("⚠️ Telegram enabled but token/chat_id not configured")
+                    self.enable_telegram = False
+            except ImportError:
+                self.log.warning("⚠️ Telegram bot not available (python-telegram-bot not installed)")
+                self.enable_telegram = False
+            except Exception as e:
+                self.log.error(f"❌ Failed to initialize Telegram Bot: {e}")
+                self.enable_telegram = False
 
         # Sentiment data fetcher
         self.sentiment_enabled = config.sentiment_enabled
@@ -292,6 +335,22 @@ class DeepSeekAIStrategy(Strategy):
         )
 
         self.log.info("Strategy started successfully")
+        
+        # Send Telegram startup notification
+        if self.telegram_bot and self.enable_telegram:
+            try:
+                startup_msg = self.telegram_bot.format_startup_message(
+                    instrument_id=str(self.instrument_id),
+                    config={
+                        'enable_auto_sl_tp': self.enable_auto_sl_tp,
+                        'enable_oco': self.enable_oco,
+                        'enable_trailing_stop': self.enable_trailing_stop,
+                        'enable_partial_tp': hasattr(self, 'enable_partial_tp') and getattr(self, 'enable_partial_tp', False),
+                    }
+                )
+                self.telegram_bot.send_message_sync(startup_msg)
+            except Exception as e:
+                self.log.warning(f"Failed to send Telegram startup notification: {e}")
 
     def on_stop(self):
         """Actions to be performed on strategy stop."""
@@ -408,8 +467,40 @@ class DeepSeekAIStrategy(Strategy):
                 f"Confidence: {signal_data['confidence']} | "
                 f"Reason: {signal_data['reason']}"
             )
+            
+            # Send Telegram signal notification (only for actionable signals)
+            if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
+                if signal_data['signal'] in ['BUY', 'SELL']:
+                    try:
+                        signal_notification = self.telegram_bot.format_trade_signal({
+                            'signal': signal_data['signal'],
+                            'confidence': signal_data['confidence'],
+                            'price': price_data['price'],
+                            'timestamp': price_data['timestamp'],
+                            'rsi': technical_data.get('rsi', 0),
+                            'macd': technical_data.get('macd', 0),
+                            'support': technical_data.get('support', 0),
+                            'resistance': technical_data.get('resistance', 0),
+                            'reasoning': signal_data['reason'],
+                        })
+                        self.telegram_bot.send_message_sync(signal_notification)
+                    except Exception as e:
+                        self.log.warning(f"Failed to send Telegram signal notification: {e}")
+                        
         except Exception as e:
             self.log.error(f"DeepSeek AI analysis failed: {e}", exc_info=True)
+            
+            # Send error notification
+            if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
+                try:
+                    error_msg = self.telegram_bot.format_error_alert({
+                        'level': 'ERROR',
+                        'message': f"AI Analysis Failed: {str(e)[:100]}",
+                        'context': 'on_timer'
+                    })
+                    self.telegram_bot.send_message_sync(error_msg)
+                except:
+                    pass
             return
 
         # Store signal
@@ -922,6 +1013,19 @@ class DeepSeekAIStrategy(Strategy):
             f"(ID: {filled_order_id[:8]}...)"
         )
         
+        # Send Telegram order fill notification
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_fills:
+            try:
+                fill_msg = self.telegram_bot.format_order_fill({
+                    'side': event.order_side.name,
+                    'quantity': float(event.last_qty),
+                    'price': float(event.last_px),
+                    'order_type': 'MARKET',  # Could extract from order if needed
+                })
+                self.telegram_bot.send_message_sync(fill_msg)
+            except Exception as e:
+                self.log.warning(f"Failed to send Telegram fill notification: {e}")
+        
         # Check if this order belongs to an OCO group
         if self.enable_oco and self.oco_manager:
             group_id = self.oco_manager.find_group_by_order(filled_order_id)
@@ -1055,6 +1159,22 @@ class DeepSeekAIStrategy(Strategy):
             self.log.info(
                 f"📊 Trailing stop initialized for {event.side.name} position @ ${entry_price:,.2f}"
             )
+        
+        # Send Telegram position opened notification
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
+            try:
+                position_msg = self.telegram_bot.format_position_update({
+                    'action': 'OPENED',
+                    'side': event.side.name,
+                    'quantity': float(event.quantity),
+                    'entry_price': float(event.avg_px_open),
+                    'current_price': float(event.avg_px_open),
+                    'pnl': 0.0,
+                    'pnl_pct': 0.0,
+                })
+                self.telegram_bot.send_message_sync(position_msg)
+            except Exception as e:
+                self.log.warning(f"Failed to send Telegram position opened notification: {e}")
 
     def on_position_closed(self, event):
         """Handle position closed events."""
@@ -1069,6 +1189,28 @@ class DeepSeekAIStrategy(Strategy):
         if instrument_key in self.trailing_stop_state:
             del self.trailing_stop_state[instrument_key]
             self.log.debug(f"🗑️ Cleared trailing stop state for {instrument_key}")
+        
+        # Send Telegram position closed notification
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
+            try:
+                # Calculate P&L percentage (approximate)
+                pnl = float(event.realized_pnl)
+                # Get rough position size estimate for percentage
+                # Note: This is approximate, actual calculation would require more data
+                pnl_pct = (pnl / 100.0) * 100 if pnl != 0 else 0.0  # Rough estimate
+                
+                position_msg = self.telegram_bot.format_position_update({
+                    'action': 'CLOSED',
+                    'side': event.side.name,
+                    'quantity': float(event.quantity) if hasattr(event, 'quantity') else 0.0,
+                    'entry_price': float(event.avg_px_open) if hasattr(event, 'avg_px_open') else 0.0,
+                    'current_price': float(event.avg_px_close) if hasattr(event, 'avg_px_close') else 0.0,
+                    'pnl': pnl,
+                    'pnl_pct': pnl_pct,
+                })
+                self.telegram_bot.send_message_sync(position_msg)
+            except Exception as e:
+                self.log.warning(f"Failed to send Telegram position closed notification: {e}")
     
     def _cleanup_oco_orphans(self):
         """
