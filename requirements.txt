@@ -24,6 +24,8 @@ redis>=5.0.0
 # Optional: For enhanced logging
 rich>=13.0.0
 
-# Optional: For notifications (if implementing Telegram/Discord)
-# python-telegram-bot>=20.0
+# Notifications and monitoring
+python-telegram-bot>=22.0
+
+# Optional: For Discord notifications
 # discord.py>=2.0
