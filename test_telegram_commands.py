@@ -109,20 +109,42 @@ def test_command_formatters(command: str):
     print("-" * 70)
     print()
     
-    # Ask if user wants to send to Telegram
-    response = input("Send this message to Telegram? (y/n): ")
-    if response.lower() == 'y':
+    # Check if we should send automatically
+    auto_send = '--send' in sys.argv
+    no_send = '--no-send' in sys.argv
+    
+    if no_send:
+        print("ℹ️  Message not sent (--no-send flag)")
+        return
+    
+    if auto_send:
+        # Auto-send mode
+        print("📤 Sending message to Telegram...")
         success = bot.send_message_sync(message)
         if success:
             print("✅ Message sent successfully!")
         else:
             print("❌ Failed to send message")
     else:
-        print("Message not sent.")
+        # Interactive mode (if possible)
+        try:
+            response = input("Send this message to Telegram? (y/n): ")
+            if response.lower() == 'y':
+                success = bot.send_message_sync(message)
+                if success:
+                    print("✅ Message sent successfully!")
+                else:
+                    print("❌ Failed to send message")
+            else:
+                print("Message not sent.")
+        except (EOFError, KeyboardInterrupt):
+            # Non-interactive environment
+            print("ℹ️  Non-interactive mode - message not sent")
+            print("💡 Use --send to automatically send, or --no-send to skip")
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python test_telegram_commands.py <command>")
+    if len(sys.argv) < 2:
+        print("Usage: python test_telegram_commands.py <command> [--send|--no-send]")
         print()
         print("Commands:")
         print("  status   - Test /status command response")
@@ -130,6 +152,15 @@ def main():
         print("  pause    - Test /pause command response")
         print("  resume   - Test /resume command response")
         print("  help     - Test /help command response")
+        print()
+        print("Options:")
+        print("  --send    - Automatically send message to Telegram")
+        print("  --no-send - Only display message, don't send")
+        print()
+        print("Examples:")
+        print("  python test_telegram_commands.py status")
+        print("  python test_telegram_commands.py status --send")
+        print("  python test_telegram_commands.py position --no-send")
         sys.exit(1)
     
     command = sys.argv[1].lower()
