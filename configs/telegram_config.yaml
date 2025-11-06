@@ -1,0 +1,57 @@
+# Telegram Notification Configuration
+# 
+# Configure Telegram bot for real-time trading notifications
+
+telegram:
+  # Enable/disable Telegram notifications
+  enabled: false  # Set to true after configuring token and chat_id
+  
+  # Bot credentials (stored in .env file)
+  bot_token: "${TELEGRAM_BOT_TOKEN}"  # Get from @BotFather
+  chat_id: "${TELEGRAM_CHAT_ID}"      # Your Telegram user ID
+  
+  # Notification settings
+  notifications:
+    # Trading notifications
+    trade_signals: true      # Send AI trading signals
+    order_fills: true        # Send order execution notifications
+    position_updates: true   # Send position open/close updates
+    partial_tp: true         # Send partial take profit notifications
+    trailing_stop: true      # Send trailing stop updates
+    
+    # System notifications
+    startup: true            # Send strategy startup message
+    shutdown: true           # Send strategy shutdown message
+    errors: true             # Send error alerts
+    warnings: true           # Send warning alerts
+    
+    # Performance notifications
+    daily_summary: false     # Send daily performance summary
+    weekly_summary: false    # Send weekly performance summary
+  
+  # Message settings
+  message_format: "markdown"  # markdown, html, or plain
+  include_emoji: true         # Use emojis in messages
+  
+  # Rate limiting (prevent spam)
+  rate_limit:
+    enabled: true
+    max_messages_per_minute: 10
+    burst_size: 5  # Allow short bursts
+  
+  # Quiet hours (optional)
+  quiet_hours:
+    enabled: false
+    start: "00:00"  # UTC time
+    end: "08:00"    # UTC time
+    urgent_only: true  # Only send critical alerts during quiet hours
+  
+  # Advanced settings
+  advanced:
+    retry_on_failure: true
+    max_retries: 3
+    retry_delay_seconds: 5
+    disable_notification: false  # Silent messages (no sound/vibration)
+    truncate_long_messages: true
+    max_message_length: 4096  # Telegram limit
+
