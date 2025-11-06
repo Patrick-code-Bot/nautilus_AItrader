@@ -201,6 +201,9 @@ class TelegramCommandHandler:
             self.is_running = True
             self.logger.info("✅ Telegram command handler started successfully")
             
+            # Keep running (this will block until stopped)
+            await self.application.updater.idle()
+            
         except Exception as e:
             self.logger.error(f"❌ Failed to start command handler: {e}")
             self.is_running = False

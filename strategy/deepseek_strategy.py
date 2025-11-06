@@ -6,6 +6,8 @@ technical indicators for market analysis, and sentiment data for validation.
 """
 
 import os
+import asyncio
+import threading
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -267,9 +269,51 @@ class DeepSeekAIStrategy(Strategy):
                     
                     self.log.info("✅ Telegram Bot initialized successfully")
                     
-                    # Initialize command handler for remote control (disabled for now - requires threading)
-                    # Will be implemented in future version with proper async handling
-                    self.telegram_command_handler = None
+                    # Initialize command handler for remote control
+                    try:
+                        from utils.telegram_command_handler import TelegramCommandHandler
+                        import threading
+                        
+                        # Create callback function for commands
+                        def command_callback(command: str, args: Dict[str, Any]) -> Dict[str, Any]:
+                            """Callback function for Telegram commands."""
+                            return self.handle_telegram_command(command, args)
+                        
+                        # Initialize command handler
+                        allowed_chat_ids = [chat_id]  # Only allow the configured chat ID
+                        self.telegram_command_handler = TelegramCommandHandler(
+                            token=bot_token,
+                            allowed_chat_ids=allowed_chat_ids,
+                            strategy_callback=command_callback,
+                            logger=self.log
+                        )
+                        
+                        # Start command handler in background thread
+                        def run_command_handler():
+                            """Run command handler in background thread."""
+                            try:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                # Start polling (this will run indefinitely via idle())
+                                loop.run_until_complete(self.telegram_command_handler.start_polling())
+                            except Exception as e:
+                                self.log.error(f"❌ Command handler thread error: {e}")
+                        
+                        # Start background thread for command listening
+                        command_thread = threading.Thread(
+                            target=run_command_handler,
+                            daemon=True,
+                            name="TelegramCommandHandler"
+                        )
+                        command_thread.start()
+                        self.log.info("✅ Telegram Command Handler started in background thread")
+                        
+                    except ImportError:
+                        self.log.warning("⚠️ Telegram command handler not available")
+                        self.telegram_command_handler = None
+                    except Exception as e:
+                        self.log.error(f"❌ Failed to initialize command handler: {e}")
+                        self.telegram_command_handler = None
                     
                 else:
                     self.log.warning("⚠️ Telegram enabled but token/chat_id not configured")
