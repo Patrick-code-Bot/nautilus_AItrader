@@ -266,6 +266,11 @@ class DeepSeekAIStrategy(Strategy):
                     self.telegram_notify_errors = config.telegram_notify_errors
                     
                     self.log.info("✅ Telegram Bot initialized successfully")
+                    
+                    # Initialize command handler for remote control (disabled for now - requires threading)
+                    # Will be implemented in future version with proper async handling
+                    self.telegram_command_handler = None
+                    
                 else:
                     self.log.warning("⚠️ Telegram enabled but token/chat_id not configured")
                     self.enable_telegram = False
@@ -275,6 +280,10 @@ class DeepSeekAIStrategy(Strategy):
             except Exception as e:
                 self.log.error(f"❌ Failed to initialize Telegram Bot: {e}")
                 self.enable_telegram = False
+        
+        # Strategy control state for remote commands
+        self.is_trading_paused = False
+        self.strategy_start_time = None
 
         # Sentiment data fetcher
         self.sentiment_enabled = config.sentiment_enabled
@@ -336,6 +345,10 @@ class DeepSeekAIStrategy(Strategy):
 
         self.log.info("Strategy started successfully")
         
+        # Record start time for uptime tracking
+        from datetime import datetime
+        self.strategy_start_time = datetime.utcnow()
+        
         # Send Telegram startup notification
         if self.telegram_bot and self.enable_telegram:
             try:
@@ -349,6 +362,11 @@ class DeepSeekAIStrategy(Strategy):
                     }
                 )
                 self.telegram_bot.send_message_sync(startup_msg)
+                
+                # Send command help message
+                help_msg = self.telegram_bot.format_help_response()
+                self.telegram_bot.send_message_sync(help_msg)
+                
             except Exception as e:
                 self.log.warning(f"Failed to send Telegram startup notification: {e}")
 
@@ -583,6 +601,11 @@ class DeepSeekAIStrategy(Strategy):
         current_position : Dict or None
             Current position info
         """
+        # Check if trading is paused
+        if self.is_trading_paused:
+            self.log.info("⏸️ Trading is paused - skipping signal execution")
+            return
+        
         # Store signal and technical data for SL/TP calculation
         self.latest_signal_data = signal_data
         self.latest_technical_data = technical_data
@@ -1467,3 +1490,180 @@ class DeepSeekAIStrategy(Strategy):
                         
         except Exception as e:
             self.log.error(f"❌ Failed to execute trailing stop update: {e}")
+    
+    # ===== Remote Control Methods (for Telegram commands) =====
+    
+    def handle_telegram_command(self, command: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle Telegram commands.
+        
+        Parameters
+        ----------
+        command : str
+            Command name (status, position, pause, resume)
+        args : dict
+            Command arguments
+        
+        Returns
+        -------
+        dict
+            Response with 'success', 'message', and optional 'error'
+        """
+        try:
+            if command == 'status':
+                return self._cmd_status()
+            elif command == 'position':
+                return self._cmd_position()
+            elif command == 'pause':
+                return self._cmd_pause()
+            elif command == 'resume':
+                return self._cmd_resume()
+            else:
+                return {
+                    'success': False,
+                    'error': f"Unknown command: {command}"
+                }
+        except Exception as e:
+            self.log.error(f"Error handling command '{command}': {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _cmd_status(self) -> Dict[str, Any]:
+        """Handle /status command."""
+        try:
+            from datetime import datetime
+            
+            # Get current price
+            current_price = 0
+            bars = self.indicator_manager.recent_bars if hasattr(self, 'indicator_manager') else []
+            if bars:
+                current_price = float(bars[-1].close)
+            
+            # Get unrealized PnL
+            unrealized_pnl = 0
+            positions = self.cache.positions_open(instrument_id=self.instrument_id)
+            if positions:
+                position = positions[0]
+                if current_price > 0:
+                    unrealized_pnl = float(position.unrealized_pnl(current_price))
+            
+            # Calculate uptime
+            uptime_str = "N/A"
+            if self.strategy_start_time:
+                uptime_delta = datetime.utcnow() - self.strategy_start_time
+                hours = uptime_delta.total_seconds() // 3600
+                minutes = (uptime_delta.total_seconds() % 3600) // 60
+                uptime_str = f"{int(hours)}h {int(minutes)}m"
+            
+            # Get last signal
+            last_signal = "N/A"
+            last_signal_time = "N/A"
+            if hasattr(self, 'last_signal') and self.last_signal:
+                last_signal = f"{self.last_signal.get('signal', 'N/A')} ({self.last_signal.get('confidence', 'N/A')})"
+                # You could store timestamp if needed
+            
+            status_info = {
+                'is_running': True,  # If this method is called, strategy is running
+                'is_paused': self.is_trading_paused,
+                'instrument_id': str(self.instrument_id),
+                'current_price': current_price,
+                'equity': self.equity,
+                'unrealized_pnl': unrealized_pnl,
+                'last_signal': last_signal,
+                'last_signal_time': last_signal_time,
+                'uptime': uptime_str,
+            }
+            
+            message = self.telegram_bot.format_status_response(status_info) if self.telegram_bot else "Status unavailable"
+            
+            return {
+                'success': True,
+                'message': message
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _cmd_position(self) -> Dict[str, Any]:
+        """Handle /position command."""
+        try:
+            # Get current position
+            current_position = self._get_current_position_data()
+            
+            position_info = {
+                'has_position': current_position is not None,
+            }
+            
+            if current_position:
+                bars = self.indicator_manager.recent_bars if hasattr(self, 'indicator_manager') else []
+                current_price = float(bars[-1].close) if bars else current_position['avg_px']
+                
+                entry_price = current_position['avg_px']
+                pnl = current_position['unrealized_pnl']
+                pnl_pct = (pnl / (entry_price * current_position['quantity'])) * 100 if entry_price > 0 else 0
+                
+                position_info.update({
+                    'side': current_position['side'].upper(),
+                    'quantity': current_position['quantity'],
+                    'entry_price': entry_price,
+                    'current_price': current_price,
+                    'unrealized_pnl': pnl,
+                    'pnl_pct': pnl_pct,
+                    # SL/TP prices would need to be tracked separately if needed
+                })
+            
+            message = self.telegram_bot.format_position_response(position_info) if self.telegram_bot else "Position unavailable"
+            
+            return {
+                'success': True,
+                'message': message
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _cmd_pause(self) -> Dict[str, Any]:
+        """Handle /pause command."""
+        try:
+            if self.is_trading_paused:
+                message = self.telegram_bot.format_pause_response(False, "Trading is already paused") if self.telegram_bot else "Already paused"
+            else:
+                self.is_trading_paused = True
+                self.log.info("⏸️ Trading paused by Telegram command")
+                message = self.telegram_bot.format_pause_response(True) if self.telegram_bot else "Trading paused"
+            
+            return {
+                'success': True,
+                'message': message
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _cmd_resume(self) -> Dict[str, Any]:
+        """Handle /resume command."""
+        try:
+            if not self.is_trading_paused:
+                message = self.telegram_bot.format_resume_response(False, "Trading is not paused") if self.telegram_bot else "Not paused"
+            else:
+                self.is_trading_paused = False
+                self.log.info("▶️ Trading resumed by Telegram command")
+                message = self.telegram_bot.format_resume_response(True) if self.telegram_bot else "Trading resumed"
+            
+            return {
+                'success': True,
+                'message': message
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }

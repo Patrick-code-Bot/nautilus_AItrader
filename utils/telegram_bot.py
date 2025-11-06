@@ -342,6 +342,129 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"❌ Failed to connect to Telegram: {e}")
             return False
+    
+    # ===== Remote Control Command Formatters =====
+    
+    def format_status_response(self, status_info: Dict[str, Any]) -> str:
+        """
+        Format strategy status response for /status command.
+        
+        Parameters
+        ----------
+        status_info : dict
+            Status information containing:
+            - is_running: bool
+            - is_paused: bool
+            - instrument_id: str
+            - current_price: float
+            - equity: float
+            - unrealized_pnl: float
+            - last_signal: str
+            - last_signal_time: str
+            - uptime: str
+        """
+        is_running = status_info.get('is_running', False)
+        is_paused = status_info.get('is_paused', False)
+        
+        # Status emoji
+        if not is_running:
+            status_emoji = "🔴"
+            status_text = "STOPPED"
+        elif is_paused:
+            status_emoji = "⏸️"
+            status_text = "PAUSED"
+        else:
+            status_emoji = "🟢"
+            status_text = "RUNNING"
+        
+        msg = f"{status_emoji} *Strategy Status*\n\n"
+        msg += f"*Status*: {status_text}\n"
+        msg += f"*Instrument*: {status_info.get('instrument_id', 'N/A')}\n"
+        msg += f"*Current Price*: ${status_info.get('current_price', 0):,.2f}\n"
+        msg += f"*Equity*: ${status_info.get('equity', 0):,.2f}\n"
+        
+        pnl = status_info.get('unrealized_pnl', 0)
+        pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
+        msg += f"*Unrealized P&L*: {pnl_emoji} ${pnl:,.2f}\n\n"
+        
+        msg += f"*Last Signal*: {status_info.get('last_signal', 'N/A')}\n"
+        msg += f"*Signal Time*: {status_info.get('last_signal_time', 'N/A')}\n"
+        msg += f"*Uptime*: {status_info.get('uptime', 'N/A')}\n"
+        
+        return msg
+    
+    def format_position_response(self, position_info: Dict[str, Any]) -> str:
+        """
+        Format position information response for /position command.
+        
+        Parameters
+        ----------
+        position_info : dict
+            Position information containing:
+            - has_position: bool
+            - side: LONG/SHORT
+            - quantity: float
+            - entry_price: float
+            - current_price: float
+            - unrealized_pnl: float
+            - pnl_pct: float
+            - sl_price: float (optional)
+            - tp_price: float (optional)
+        """
+        if not position_info.get('has_position', False):
+            return "ℹ️ *No Open Position*\n\nCurrently not holding any position."
+        
+        side = position_info.get('side', 'UNKNOWN')
+        side_emoji = "🟢" if side == "LONG" else "🔴" if side == "SHORT" else "⚪"
+        
+        msg = f"{side_emoji} *Open Position*\n\n"
+        msg += f"*Side*: {side}\n"
+        msg += f"*Quantity*: {position_info.get('quantity', 0):.4f}\n"
+        msg += f"*Entry Price*: ${position_info.get('entry_price', 0):,.2f}\n"
+        msg += f"*Current Price*: ${position_info.get('current_price', 0):,.2f}\n\n"
+        
+        pnl = position_info.get('unrealized_pnl', 0)
+        pnl_pct = position_info.get('pnl_pct', 0)
+        pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➖"
+        msg += f"*Unrealized P&L*: {pnl_emoji} ${pnl:,.2f} ({pnl_pct:+.2f}%)\n\n"
+        
+        # Add SL/TP if available
+        sl_price = position_info.get('sl_price')
+        tp_price = position_info.get('tp_price')
+        
+        if sl_price:
+            msg += f"🛡️ *Stop Loss*: ${sl_price:,.2f}\n"
+        if tp_price:
+            msg += f"🎯 *Take Profit*: ${tp_price:,.2f}\n"
+        
+        return msg
+    
+    def format_pause_response(self, success: bool, message: str = "") -> str:
+        """Format response for /pause command."""
+        if success:
+            return "⏸️ *Strategy Paused*\n\nTrading has been paused. No new orders will be placed.\nUse /resume to continue trading."
+        else:
+            return f"❌ *Failed to Pause*\n\n{message}"
+    
+    def format_resume_response(self, success: bool, message: str = "") -> str:
+        """Format response for /resume command."""
+        if success:
+            return "▶️ *Strategy Resumed*\n\nTrading has been resumed. Strategy is now active."
+        else:
+            return f"❌ *Failed to Resume*\n\n{message}"
+    
+    def format_help_response(self) -> str:
+        """Format help message with available commands."""
+        msg = "🤖 *Available Commands*\n\n"
+        msg += "*Query Commands*:\n"
+        msg += "• `/status` - View strategy status\n"
+        msg += "• `/position` - View current position\n"
+        msg += "• `/help` - Show this help message\n\n"
+        msg += "*Control Commands*:\n"
+        msg += "• `/pause` - Pause trading (no new orders)\n"
+        msg += "• `/resume` - Resume trading\n\n"
+        msg += "💡 _Commands are case-insensitive_\n"
+        return msg
 
 
 # Convenience function for quick testing

@@ -188,6 +188,15 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
+        
+        # Telegram Notifications
+        enable_telegram=strategy_yaml.get('telegram', {}).get('enabled', False),
+        telegram_bot_token=get_env_str('TELEGRAM_BOT_TOKEN', ''),
+        telegram_chat_id=get_env_str('TELEGRAM_CHAT_ID', ''),
+        telegram_notify_signals=strategy_yaml.get('telegram', {}).get('notify_signals', True),
+        telegram_notify_fills=strategy_yaml.get('telegram', {}).get('notify_fills', True),
+        telegram_notify_positions=strategy_yaml.get('telegram', {}).get('notify_positions', True),
+        telegram_notify_errors=strategy_yaml.get('telegram', {}).get('notify_errors', True),
     )
 
 

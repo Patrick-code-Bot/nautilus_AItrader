@@ -86,15 +86,18 @@ strategy:
     partial_tp_levels:  # 止盈级别配置 (百分比, 仓位比例)
       - {profit_pct: 0.02, position_pct: 0.5}  # 盈利2%时平50%仓位
       - {profit_pct: 0.04, position_pct: 0.5}  # 盈利4%时平剩余50%仓位
+
+  # Telegram Notifications (Telegram 通知)
+  telegram:
+    enabled: true  # 启用 Telegram 通知 (配置后设为 true)
+    bot_token: ""  # Bot Token (从 .env 读取 TELEGRAM_BOT_TOKEN)
+    chat_id: ""    # Chat ID (从 .env 读取 TELEGRAM_CHAT_ID)
     
-    # Telegram Notifications (Telegram 通知)
-    enable_telegram: false  # 启用 Telegram 通知 (配置后设为 true)
-    telegram_bot_token: ""  # Bot Token (从 .env 读取 TELEGRAM_BOT_TOKEN)
-    telegram_chat_id: ""    # Chat ID (从 .env 读取 TELEGRAM_CHAT_ID)
-    telegram_notify_signals: true     # 通知交易信号
-    telegram_notify_fills: true       # 通知订单成交
-    telegram_notify_positions: true   # 通知持仓变化
-    telegram_notify_errors: true      # 通知错误
+    # 通知类型控制
+    notify_signals: true      # 通知交易信号
+    notify_fills: true        # 通知订单成交
+    notify_positions: true    # 通知持仓变化
+    notify_errors: true       # 通知错误
 
   # Execution
   execution:
