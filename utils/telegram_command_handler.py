@@ -70,7 +70,18 @@ class TelegramCommandHandler:
     def _is_authorized(self, update: Update) -> bool:
         """Check if the user is authorized to send commands."""
         chat_id = str(update.effective_chat.id)
-        return chat_id in self.allowed_chat_ids
+        is_authorized = chat_id in self.allowed_chat_ids
+
+        # Log authorization attempt for debugging
+        if not is_authorized:
+            self.logger.warning(
+                f"Unauthorized command attempt from chat_id: {chat_id} "
+                f"(allowed: {self.allowed_chat_ids})"
+            )
+        else:
+            self.logger.info(f"Authorized command from chat_id: {chat_id}")
+
+        return is_authorized
     
     async def _send_response(self, update: Update, message: str):
         """Send response message."""
@@ -84,14 +95,16 @@ class TelegramCommandHandler:
     
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command."""
+        self.logger.info("Received /status command")
+
         if not self._is_authorized(update):
             await self._send_response(update, "❌ Unauthorized")
             return
-        
+
         try:
             # Call strategy callback to get status
             result = self.strategy_callback('status', {})
-            
+
             if result.get('success'):
                 await self._send_response(update, result.get('message', 'No status available'))
             else:
@@ -102,14 +115,16 @@ class TelegramCommandHandler:
     
     async def cmd_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /position command."""
+        self.logger.info("Received /position command")
+
         if not self._is_authorized(update):
             await self._send_response(update, "❌ Unauthorized")
             return
-        
+
         try:
             # Call strategy callback to get position
             result = self.strategy_callback('position', {})
-            
+
             if result.get('success'):
                 await self._send_response(update, result.get('message', 'No position info'))
             else:
@@ -120,14 +135,16 @@ class TelegramCommandHandler:
     
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /pause command."""
+        self.logger.info("Received /pause command")
+
         if not self._is_authorized(update):
             await self._send_response(update, "❌ Unauthorized")
             return
-        
+
         try:
             # Call strategy callback to pause
             result = self.strategy_callback('pause', {})
-            
+
             if result.get('success'):
                 await self._send_response(update, result.get('message', '⏸️ Trading paused'))
             else:
@@ -138,14 +155,16 @@ class TelegramCommandHandler:
     
     async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /resume command."""
+        self.logger.info("Received /resume command")
+
         if not self._is_authorized(update):
             await self._send_response(update, "❌ Unauthorized")
             return
-        
+
         try:
             # Call strategy callback to resume
             result = self.strategy_callback('resume', {})
-            
+
             if result.get('success'):
                 await self._send_response(update, result.get('message', '▶️ Trading resumed'))
             else:
@@ -156,10 +175,12 @@ class TelegramCommandHandler:
     
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command."""
+        self.logger.info("Received /help command")
+
         if not self._is_authorized(update):
             await self._send_response(update, "❌ Unauthorized")
             return
-        
+
         help_msg = (
             "🤖 *Available Commands*\n\n"
             "*Query Commands*:\n"
@@ -178,11 +199,11 @@ class TelegramCommandHandler:
         if not TELEGRAM_AVAILABLE:
             self.logger.error("Telegram not available")
             return
-        
+
         try:
             # Create application
             self.application = Application.builder().token(self.token).build()
-            
+
             # Register command handlers
             self.application.add_handler(CommandHandler("status", self.cmd_status))
             self.application.add_handler(CommandHandler("position", self.cmd_position))
@@ -190,23 +211,28 @@ class TelegramCommandHandler:
             self.application.add_handler(CommandHandler("resume", self.cmd_resume))
             self.application.add_handler(CommandHandler("help", self.cmd_help))
             self.application.add_handler(CommandHandler("start", self.cmd_help))  # Alias for help
-            
+
             self.logger.info("🤖 Starting Telegram command handler...")
-            
-            # Start polling
+
+            # Start polling - compatible with python-telegram-bot v20+
             await self.application.initialize()
             await self.application.start()
-            await self.application.updater.start_polling()
-            
+            await self.application.updater.start_polling(
+                allowed_updates=["message"]  # Only listen to messages
+            )
+
             self.is_running = True
             self.logger.info("✅ Telegram command handler started successfully")
-            
-            # Keep running (this will block until stopped)
-            await self.application.updater.idle()
-            
+
+            # Keep the event loop running
+            # Create a never-ending task to keep polling alive
+            stop_signal = asyncio.Event()
+            await stop_signal.wait()  # This will wait forever until explicitly set
+
         except Exception as e:
             self.logger.error(f"❌ Failed to start command handler: {e}")
             self.is_running = False
+            raise
     
     async def stop_polling(self):
         """Stop the command handler."""
