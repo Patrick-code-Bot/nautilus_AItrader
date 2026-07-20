@@ -6,6 +6,8 @@ technical indicators for market analysis, and sentiment data for validation.
 """
 
 import os
+import json
+import math
 import asyncio
 import threading
 from decimal import Decimal
@@ -15,11 +17,12 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce, PositionSide, PriceType, TriggerType, OrderType
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.position import Position
 from nautilus_trader.model.orders import MarketOrder
-from datetime import timedelta
+from nautilus_trader.model.currencies import USDT
+from datetime import datetime, timedelta
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,6 +121,18 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Execution
     position_adjustment_threshold: float = 0.001
 
+    # Phase 0 safety: risk-based sizing & kill-switches
+    risk_per_trade_pct: float = 0.01  # Fraction of live equity risked per trade (SL distance based)
+    max_position_leverage: float = 2.0  # Max position notional as multiple of live equity
+    min_notional_usdt: float = 100.0  # Binance minimum notional; trades below this are SKIPPED, never upsized
+    daily_loss_limit_pct: float = 0.03  # Halt new trades for the day beyond this daily loss
+    max_consecutive_losses: int = 5  # Pause trading after this many consecutive losing closes
+    loss_pause_hours: float = 24.0  # Pause duration after kill-switch triggers
+    max_consecutive_same_signal: int = 5  # Block churn after this many identical consecutive signals
+    disaster_stop_enabled: bool = True  # Native exchange-side catastrophic stop (survives restarts)
+    disaster_stop_min_pct: float = 0.015  # Minimum distance of the disaster stop from entry
+    risk_state_file: str = "logs/risk_state.json"  # Persisted kill-switch state (survives restarts)
+
     # Timing
     timer_interval_sec: int = 900
 
@@ -205,6 +220,30 @@ class DeepSeekAIStrategy(Strategy):
         #       "side": str (LONG/SHORT)
         #   }
         # }
+
+        # Phase 0 safety: risk-based sizing & kill-switches
+        self.risk_per_trade_pct = config.risk_per_trade_pct
+        self.max_position_leverage = config.max_position_leverage
+        self.min_notional_usdt = config.min_notional_usdt
+        self.daily_loss_limit_pct = config.daily_loss_limit_pct
+        self.max_consecutive_losses = config.max_consecutive_losses
+        self.loss_pause_hours = config.loss_pause_hours
+        self.max_consecutive_same_signal = config.max_consecutive_same_signal
+        self.disaster_stop_enabled = config.disaster_stop_enabled
+        self.disaster_stop_min_pct = config.disaster_stop_min_pct
+        self.risk_state_file = config.risk_state_file
+
+        # Kill-switch state (persisted to risk_state_file, survives restarts)
+        self.risk_state: Dict[str, Any] = {
+            "consecutive_losses": 0,
+            "paused_until": None,      # ISO timestamp (UTC) while paused
+            "day_date": None,          # UTC date of current daily baseline
+            "day_start_equity": None,  # Equity at start of UTC day
+        }
+
+        # Native disaster-stop orders (exchange-side, survive process restarts)
+        # Format: {instrument_id: {"order_id": str, "price": float}}
+        self.disaster_stop_state: Dict[str, Dict[str, Any]] = {}
 
         # Technical indicators manager
         sma_periods = config.sma_periods if config.sma_periods else [5, 20, 50]
@@ -378,6 +417,9 @@ class DeepSeekAIStrategy(Strategy):
         )
 
         self.log.info("Strategy started successfully")
+
+        # Restore persisted kill-switch state (daily baseline, loss streaks, pauses)
+        self._load_risk_state()
 
         # Record start time for uptime tracking
         from datetime import datetime
@@ -712,6 +754,220 @@ class DeepSeekAIStrategy(Strategy):
 
         return None
 
+    # ===== Phase 0 safety helpers =====
+
+    def _get_account_equity(self) -> float:
+        """
+        Get live USDT wallet balance from the portfolio.
+
+        Falls back to the configured equity if the live balance
+        is unavailable (e.g. account not yet loaded).
+        """
+        try:
+            account = self.portfolio.account(self.instrument_id.venue)
+            if account is not None:
+                balance = account.balance_total(USDT)
+                if balance is not None:
+                    equity = float(balance)
+                    if equity > 0:
+                        return equity
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not read live account balance: {e}")
+        return float(self.equity)
+
+    def _calculate_stop_loss_price(self, side: str, entry_price: float) -> float:
+        """
+        Calculate stop-loss price for a position side ('long'/'short').
+
+        Uses support/resistance levels when enabled and available,
+        otherwise a default 2% stop.
+        """
+        technical = self.latest_technical_data or {}
+        support = technical.get('support', 0.0)
+        resistance = technical.get('resistance', 0.0)
+
+        if side == 'long':
+            if self.sl_use_support_resistance and support > 0:
+                return support * (1 - self.sl_buffer_pct)
+            return entry_price * 0.98
+        else:
+            if self.sl_use_support_resistance and resistance > 0:
+                return resistance * (1 + self.sl_buffer_pct)
+            return entry_price * 1.02
+
+    def _same_signal_run_length(self) -> int:
+        """Count trailing consecutive identical AI signals (including latest)."""
+        history = getattr(self.deepseek, 'signal_history', [])
+        if not history:
+            return 0
+        last = history[-1].get('signal')
+        run = 0
+        for s in reversed(history):
+            if s.get('signal') == last:
+                run += 1
+            else:
+                break
+        return run
+
+    def _load_risk_state(self) -> None:
+        """Load persisted kill-switch state (survives restarts)."""
+        try:
+            if os.path.exists(self.risk_state_file):
+                with open(self.risk_state_file, 'r') as f:
+                    saved = json.load(f)
+                if isinstance(saved, dict):
+                    for key in self.risk_state:
+                        if key in saved:
+                            self.risk_state[key] = saved[key]
+                self.log.info(f"🛡️ Risk state loaded: {self.risk_state}")
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not load risk state file: {e}")
+
+    def _save_risk_state(self) -> None:
+        """Persist kill-switch state to disk."""
+        try:
+            directory = os.path.dirname(self.risk_state_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self.risk_state_file, 'w') as f:
+                json.dump(self.risk_state, f)
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not save risk state file: {e}")
+
+    def _trigger_pause(self, reason: str) -> None:
+        """Pause new trading for loss_pause_hours and notify."""
+        paused_until = self.clock.utc_now().to_pydatetime() + timedelta(hours=self.loss_pause_hours)
+        self.risk_state["paused_until"] = paused_until.isoformat()
+        self._save_risk_state()
+        self.log.error(
+            f"🛡️ TRADING PAUSED for {self.loss_pause_hours:.0f}h: {reason}"
+        )
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
+            try:
+                alert = self.telegram_bot.format_error_alert({
+                    'level': 'RISK',
+                    'message': f"Trading paused {self.loss_pause_hours:.0f}h: {reason}"[:200],
+                    'context': 'risk_guard',
+                })
+                self.telegram_bot.send_message_sync(alert)
+            except Exception:
+                pass
+
+    def _check_risk_guards(self) -> bool:
+        """
+        Evaluate kill-switches before any trade execution.
+
+        Returns True if trading is allowed, False if blocked.
+        """
+        now = self.clock.utc_now().to_pydatetime()
+        today = now.strftime('%Y-%m-%d')
+
+        # (1) UTC day rollover: reset the daily equity baseline
+        if self.risk_state.get("day_date") != today:
+            self.risk_state["day_date"] = today
+            self.risk_state["day_start_equity"] = self._get_account_equity()
+            self._save_risk_state()
+
+        # (2) Active pause?
+        paused_until_str = self.risk_state.get("paused_until")
+        if paused_until_str:
+            try:
+                paused_until = datetime.fromisoformat(paused_until_str)
+                if now < paused_until:
+                    self.log.warning(
+                        f"🛡️ Risk guard: trading paused until {paused_until_str} (UTC)"
+                    )
+                    return False
+                # Pause expired: clear and reset the loss streak
+                self.risk_state["paused_until"] = None
+                self.risk_state["consecutive_losses"] = 0
+                self._save_risk_state()
+                self.log.info("🛡️ Risk guard: pause expired, trading resumed")
+            except ValueError:
+                self.risk_state["paused_until"] = None
+
+        # (3) Daily loss limit vs live equity
+        start_equity = self.risk_state.get("day_start_equity")
+        if start_equity and start_equity > 0:
+            equity_now = self._get_account_equity()
+            daily_pnl_pct = (equity_now - start_equity) / start_equity
+            if daily_pnl_pct <= -self.daily_loss_limit_pct:
+                self._trigger_pause(
+                    f"Daily loss limit hit: {daily_pnl_pct:+.2%} "
+                    f"(limit -{self.daily_loss_limit_pct:.2%})"
+                )
+                return False
+
+        # (4) Anti-churn: block after too many consecutive identical signals
+        run = self._same_signal_run_length()
+        if run > self.max_consecutive_same_signal:
+            self.log.warning(
+                f"🛡️ Risk guard: {run} consecutive identical signals "
+                f"(max {self.max_consecutive_same_signal}) - blocking churn"
+            )
+            return False
+
+        return True
+
+    def _submit_disaster_stop(self, side: str, quantity: float, entry_price: float) -> None:
+        """
+        Submit a native exchange-side catastrophic stop-loss.
+
+        Unlike emulated stops (which die with the process), this STOP_MARKET
+        order lives on Binance and protects the position even if the bot
+        crashes or restarts. It is placed at 2x the normal SL distance
+        (minimum disaster_stop_min_pct) so the regular emulated SL and
+        trailing stop trigger first under normal operation.
+        """
+        try:
+            sl_price = self._calculate_stop_loss_price(side, entry_price)
+            sl_dist_pct = abs(entry_price - sl_price) / entry_price
+            disaster_dist_pct = max(2.0 * sl_dist_pct, self.disaster_stop_min_pct)
+
+            if side == 'long':
+                stop_price = entry_price * (1 - disaster_dist_pct)
+                exit_side = OrderSide.SELL
+            else:
+                stop_price = entry_price * (1 + disaster_dist_pct)
+                exit_side = OrderSide.BUY
+
+            order = self.order_factory.stop_market(
+                instrument_id=self.instrument_id,
+                order_side=exit_side,
+                quantity=self.instrument.make_qty(quantity),
+                trigger_price=self.instrument.make_price(stop_price),
+                trigger_type=TriggerType.LAST_PRICE,
+                time_in_force=TimeInForce.GTC,
+                reduce_only=True,
+            )
+            self.submit_order(order)
+
+            self.disaster_stop_state[str(self.instrument_id)] = {
+                "order_id": str(order.client_order_id),
+                "price": stop_price,
+            }
+            self.log.info(
+                f"🛡️ Native disaster stop submitted @ ${stop_price:,.2f} "
+                f"({disaster_dist_pct:.2%} from entry, qty {quantity})"
+            )
+        except Exception as e:
+            self.log.error(f"❌ Failed to submit disaster stop: {e}")
+
+    def _cancel_disaster_stop(self) -> None:
+        """Cancel the native disaster stop if one is open."""
+        state = self.disaster_stop_state.pop(str(self.instrument_id), None)
+        if not state:
+            return
+        try:
+            order = self.cache.order(ClientOrderId(state["order_id"]))
+            if order and order.is_open:
+                self.cancel_order(order)
+                self.log.info(
+                    f"🗑️ Cancelled disaster stop {state['order_id'][:8]}..."
+                )
+        except Exception as e:
+            self.log.warning(f"⚠️ Failed to cancel disaster stop: {e}")
+
     def _execute_trade(
         self,
         signal_data: Dict[str, Any],
@@ -736,6 +992,10 @@ class DeepSeekAIStrategy(Strategy):
         # Check if trading is paused
         if self.is_trading_paused:
             self.log.info("⏸️ Trading is paused - skipping signal execution")
+            return
+
+        # Phase 0 kill-switches (daily loss limit, loss streaks, anti-churn)
+        if not self._check_risk_guards():
             return
         
         # Store signal and technical data for SL/TP calculation
@@ -790,28 +1050,43 @@ class DeepSeekAIStrategy(Strategy):
         current_position: Optional[Dict[str, Any]],
     ) -> float:
         """
-        Calculate intelligent position size.
+        Calculate risk-based position size (Phase 0).
 
-        Returns BTC quantity based on confidence, trend, and RSI.
+        Size is derived from LIVE account equity and the stop-loss distance:
+        quantity = risk_usdt / (sl_distance_pct * price), where risk_usdt is
+        equity * risk_per_trade_pct scaled by confidence/trend/RSI modifiers.
+        Notional is capped at max_position_leverage * equity. If the result
+        is below the exchange minimum notional, the trade is SKIPPED (never
+        upsized to meet the minimum).
+
+        Returns BTC quantity, or 0.0 when the trade is not allowed.
         """
-        # Base USDT amount
-        base_usdt = self.base_usdt
+        entry_price = price_data['price']
+        side = 'long' if signal_data['signal'] == 'BUY' else 'short'
 
-        # Confidence multiplier
+        # Live equity (falls back to configured equity if unavailable)
+        equity = self._get_account_equity()
+
+        # Stop-loss distance drives the size
+        sl_price = self._calculate_stop_loss_price(side, entry_price)
+        sl_distance_pct = abs(entry_price - sl_price) / entry_price
+
+        # Floor the distance to avoid degenerate huge sizes when S/R == entry
+        MIN_SL_DISTANCE_PCT = 0.002  # 0.2%
+        if sl_distance_pct < MIN_SL_DISTANCE_PCT:
+            sl_distance_pct = MIN_SL_DISTANCE_PCT
+
+        # Confidence / trend / RSI modifiers scale RISK, not notional
         conf_mult = self.position_config.get(
             f"{signal_data['confidence'].lower()}_confidence_multiplier",
             1.0
         )
-
-        # Trend multiplier
         trend = technical_data.get('overall_trend', '震荡整理')
         trend_mult = (
             self.position_config['trend_strength_multiplier']
             if trend in ['强势上涨', '强势下跌']
             else 1.0
         )
-
-        # RSI multiplier (reduce size in extreme RSI)
         rsi = technical_data.get('rsi', 50)
         rsi_mult = (
             self.rsi_extreme_mult
@@ -819,51 +1094,35 @@ class DeepSeekAIStrategy(Strategy):
             else 1.0
         )
 
-        # Calculate suggested USDT
-        suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
+        risk_usdt = equity * self.risk_per_trade_pct * conf_mult * trend_mult * rsi_mult
+        quantity = risk_usdt / (sl_distance_pct * entry_price)
 
-        # Apply max position ratio limit
-        max_usdt = self.equity * self.position_config['max_position_ratio']
-        final_usdt = min(suggested_usdt, max_usdt)
+        # Notional cap: max_position_leverage * live equity
+        max_notional = equity * self.max_position_leverage
+        if quantity * entry_price > max_notional:
+            quantity = max_notional / entry_price
 
-        # Enforce Binance minimum notional requirement ($100)
-        MIN_NOTIONAL_USDT = 100.0
-        if final_usdt < MIN_NOTIONAL_USDT:
-            final_usdt = MIN_NOTIONAL_USDT
+        # Round DOWN to instrument precision (never round up beyond risk)
+        quantity = math.floor(quantity * 1000) / 1000
 
-        # Convert to BTC quantity
-        current_price = price_data['price']
-        btc_quantity = final_usdt / current_price
-
-        # Apply minimum trade amount
-        if btc_quantity < self.position_config['min_trade_amount']:
-            btc_quantity = self.position_config['min_trade_amount']
-
-        # Round to instrument precision
-        btc_quantity = round(btc_quantity, 3)  # Binance BTC precision
-
-        # CRITICAL: Re-check notional after rounding to ensure still >= $100
-        # Rounding can reduce the quantity below minimum notional threshold
-        actual_notional = btc_quantity * current_price
-        if actual_notional < MIN_NOTIONAL_USDT:
-            # Increase quantity to meet minimum notional (round UP)
-            btc_quantity = MIN_NOTIONAL_USDT / current_price
-            # Round up to next 0.001 to ensure we stay above minimum
-            import math
-            btc_quantity = math.ceil(btc_quantity * 1000) / 1000
+        # Minimum notional: skip the trade instead of inflating size
+        notional = quantity * entry_price
+        if quantity < self.position_config['min_trade_amount'] or notional < self.min_notional_usdt:
             self.log.warning(
-                f"⚠️ Adjusted quantity after rounding: {btc_quantity:.3f} BTC "
-                f"to meet ${MIN_NOTIONAL_USDT} minimum notional"
+                f"🛡️ Trade skipped: sized {quantity:.3f} BTC (${notional:.2f}) is below "
+                f"minimum (${self.min_notional_usdt:.0f} notional) at current equity "
+                f"${equity:.2f}. Risk limits not violated - no trade."
             )
+            return 0.0
 
         self.log.info(
-            f"📊 Position Sizing: "
-            f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult} "
-            f"= ${final_usdt:.2f} = {btc_quantity:.3f} BTC "
-            f"(notional: ${btc_quantity * current_price:.2f})"
+            f"📊 Position Sizing: equity ${equity:.2f} | "
+            f"risk ${risk_usdt:.2f} ({self.risk_per_trade_pct:.2%} × Conf:{conf_mult} "
+            f"× Trend:{trend_mult} × RSI:{rsi_mult}) | "
+            f"SL dist {sl_distance_pct:.2%} → {quantity:.3f} BTC (notional: ${notional:.2f})"
         )
 
-        return btc_quantity
+        return quantity
 
     def _manage_existing_position(
         self,
@@ -872,7 +1131,7 @@ class DeepSeekAIStrategy(Strategy):
         target_quantity: float,
         confidence: str,
     ):
-        """Manage existing position (add, reduce, or reverse)."""
+        """Manage existing position (reduce or close only; adds/re-entries blocked)."""
         current_side = current_position['side']
         current_qty = current_position['quantity']
 
@@ -888,16 +1147,13 @@ class DeepSeekAIStrategy(Strategy):
                 return
 
             if size_diff > 0:
-                # Add to position
-                self._submit_order(
-                    side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
-                    quantity=abs(size_diff),
-                    reduce_only=False,
-                )
+                # Phase 0: pyramiding disabled. Adds are not covered by the
+                # bracket SL/TP and previously allowed uncapped position growth.
                 self.log.info(
-                    f"📈 Adding to {target_side} position: {abs(size_diff):.3f} BTC "
-                    f"({current_qty:.3f} → {target_quantity:.3f})"
+                    f"🛡️ Add to {target_side} position blocked (pyramiding disabled): "
+                    f"keeping {current_qty:.3f} BTC"
                 )
+                return
             else:
                 # Reduce position
                 self._submit_order(
@@ -910,7 +1166,7 @@ class DeepSeekAIStrategy(Strategy):
                     f"({current_qty:.3f} → {target_quantity:.3f})"
                 )
 
-        # Opposite direction - reverse position
+        # Opposite direction - close only, do NOT re-open
         elif self.allow_reversals:
             # Check if high confidence required for reversal
             if self.require_high_conf_reversal and confidence != 'HIGH':
@@ -920,20 +1176,21 @@ class DeepSeekAIStrategy(Strategy):
                 )
                 return
 
-            self.log.info(f"🔄 Reversing position: {current_side} → {target_side}")
+            # Phase 0: close-only reversal. The old logic re-opened via a plain
+            # market order, leaving the new position with NO SL/TP and no
+            # trailing stop state. Now we only close; if the signal persists,
+            # the next cycle opens a fresh position through _open_new_position
+            # with full bracket SL/TP protection.
+            self.log.info(
+                f"🔄 Reversal signal ({current_side} → {target_side}): closing position "
+                f"only; a protected {target_side} entry will be evaluated next cycle"
+            )
 
             # Close current position
             self._submit_order(
                 side=OrderSide.SELL if current_side == 'long' else OrderSide.BUY,
                 quantity=current_qty,
                 reduce_only=True,
-            )
-
-            # Open opposite position
-            self._submit_order(
-                side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
-                quantity=target_quantity,
-                reduce_only=False,
             )
 
         else:
@@ -1029,8 +1286,8 @@ class DeepSeekAIStrategy(Strategy):
             return
 
         if not self.latest_signal_data or not self.latest_technical_data:
-            self.log.warning("⚠️ No signal/technical data available for SL/TP - submitting simple market order")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
+            # Phase 0: never open an unprotected position as a fallback
+            self.log.error("❌ No signal/technical data available for SL/TP - skipping entry")
             return
 
         # Determine latest price for entry estimation
@@ -1050,32 +1307,20 @@ class DeepSeekAIStrategy(Strategy):
                 entry_price = float(cache_bars[-1].close)
 
         if entry_price is None or entry_price <= 0:
-            self.log.error("❌ Unable to determine entry price for bracket order, submitting market order instead")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
+            # Phase 0: never open an unprotected position as a fallback
+            self.log.error("❌ Unable to determine entry price for bracket order - skipping entry")
             return
 
-        # Get confidence and technical data
+        # Get confidence for TP calculation
         confidence = self.latest_signal_data.get('confidence', 'MEDIUM')
-        support = self.latest_technical_data.get('support', 0.0)
-        resistance = self.latest_technical_data.get('resistance', 0.0)
 
-        # Calculate Stop Loss price
+        # Calculate Stop Loss price (shared with risk-based position sizing)
+        side_str = 'long' if side == OrderSide.BUY else 'short'
+        stop_loss_price = self._calculate_stop_loss_price(side_str, entry_price)
         if side == OrderSide.BUY:
-            # BUY: Stop loss below support
-            if self.sl_use_support_resistance and support > 0:
-                stop_loss_price = support * (1 - self.sl_buffer_pct)
-                self.log.info(f"📍 Using support level for SL: ${support:,.2f} → ${stop_loss_price:,.2f}")
-            else:
-                stop_loss_price = entry_price * 0.98  # Default 2% below entry
-                self.log.info(f"📍 Using default 2% SL: ${stop_loss_price:,.2f}")
+            self.log.info(f"📍 Stop loss for LONG: ${stop_loss_price:,.2f}")
         else:
-            # SELL: Stop loss above resistance
-            if self.sl_use_support_resistance and resistance > 0:
-                stop_loss_price = resistance * (1 + self.sl_buffer_pct)
-                self.log.info(f"📍 Using resistance level for SL: ${resistance:,.2f} → ${stop_loss_price:,.2f}")
-            else:
-                stop_loss_price = entry_price * 1.02  # Default 2% above entry
-                self.log.info(f"📍 Using default 2% SL: ${stop_loss_price:,.2f}")
+            self.log.info(f"📍 Stop loss for SHORT: ${stop_loss_price:,.2f}")
 
         # Calculate Take Profit price (use first level for bracket order)
         # Note: Bracket orders support single TP. For multiple TPs, we'll submit additional orders after entry fills
@@ -1145,9 +1390,8 @@ class DeepSeekAIStrategy(Strategy):
                     )
 
         except Exception as e:
-            self.log.error(f"❌ Failed to submit bracket order: {e}")
-            self.log.warning("⚠️ Falling back to simple market order without SL/TP")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
+            # Phase 0: never fall back to an unprotected naked entry
+            self.log.error(f"❌ Failed to submit bracket order: {e} - entry skipped (no unprotected positions)")
 
     def on_order_filled(self, event):
         """
@@ -1228,6 +1472,16 @@ class DeepSeekAIStrategy(Strategy):
                     f"📊 Trailing stop initialized for {event.side.name} position @ ${entry_price:,.2f}"
                 )
 
+        # Phase 0: native exchange-side catastrophic stop, independent of the
+        # (emulated) bracket SL. Protects the position if this process dies.
+        if self.disaster_stop_enabled:
+            side_str = 'long' if event.side == PositionSide.LONG else 'short'
+            self._submit_disaster_stop(
+                side=side_str,
+                quantity=float(event.quantity),
+                entry_price=float(event.avg_px_open),
+            )
+
         # Send Telegram position opened notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
             try:
@@ -1251,7 +1505,23 @@ class DeepSeekAIStrategy(Strategy):
             f"🔴 Position closed: {event.side.name} "
             f"P&L: {float(event.realized_pnl):.2f} USDT"
         )
-        
+
+        # Phase 0: consecutive-loss kill-switch
+        realized_pnl = float(event.realized_pnl)
+        if realized_pnl < 0:
+            self.risk_state["consecutive_losses"] = int(self.risk_state.get("consecutive_losses", 0)) + 1
+        else:
+            self.risk_state["consecutive_losses"] = 0
+        if self.risk_state["consecutive_losses"] >= self.max_consecutive_losses:
+            self._trigger_pause(
+                f"{self.risk_state['consecutive_losses']} consecutive losing trades "
+                f"(max {self.max_consecutive_losses})"
+            )
+        self._save_risk_state()
+
+        # Cancel the native disaster stop (position is flat now)
+        self._cancel_disaster_stop()
+
         # Clear trailing stop state
         instrument_key = str(self.instrument_id)
         if instrument_key in self.trailing_stop_state:
@@ -1499,7 +1769,8 @@ class DeepSeekAIStrategy(Strategy):
                 quantity=self.instrument.make_qty(quantity),
                 trigger_price=self.instrument.make_price(new_sl_price),
                 trigger_type=TriggerType.LAST_PRICE,
-                emulation_trigger=TriggerType.LAST_PRICE,  # Emulate locally, not native STOP_MARKET
+                # Phase 0: native Binance STOP_MARKET (no emulation) so the stop
+                # lives on the exchange and survives process restarts
                 reduce_only=True,
             )
             self.submit_order(new_sl_order)

@@ -371,6 +371,14 @@ TIMEFRAME=15m                       # Bar timeframe (1m, 5m, 15m, 1h)
 MIN_CONFIDENCE_TO_TRADE=MEDIUM      # Minimum confidence: LOW, MEDIUM, HIGH
 MAX_POSITION_RATIO=0.10             # Max position size (10% of equity)
 
+# Phase 0 safety (kill-switches & risk-based sizing)
+RISK_PER_TRADE_PCT=0.01             # Risk per trade as fraction of LIVE equity (0.01 = 1%)
+MAX_POSITION_LEVERAGE=2.0           # Max position notional as multiple of live equity
+DAILY_LOSS_LIMIT_PCT=0.03           # Halt new trades after this daily loss (0.03 = -3%)
+MAX_CONSECUTIVE_LOSSES=5            # Pause trading after N consecutive losing closes
+LOSS_PAUSE_HOURS=24                 # Pause duration when a kill-switch triggers
+MAX_CONSECUTIVE_SAME_SIGNAL=5       # Block churn after N identical consecutive signals
+
 # ========================================
 # TELEGRAM (Optional)
 # ========================================

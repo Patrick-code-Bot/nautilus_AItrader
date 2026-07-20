@@ -183,6 +183,14 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         rsi_extreme_threshold_lower=25.0,
         rsi_extreme_multiplier=0.7,
 
+        # Phase 0 safety: risk-based sizing & kill-switches
+        risk_per_trade_pct=get_env_float('RISK_PER_TRADE_PCT', '0.01'),
+        max_position_leverage=get_env_float('MAX_POSITION_LEVERAGE', '2.0'),
+        daily_loss_limit_pct=get_env_float('DAILY_LOSS_LIMIT_PCT', '0.03'),
+        max_consecutive_losses=get_env_int('MAX_CONSECUTIVE_LOSSES', '5'),
+        loss_pause_hours=get_env_float('LOSS_PAUSE_HOURS', '24'),
+        max_consecutive_same_signal=get_env_int('MAX_CONSECUTIVE_SAME_SIGNAL', '5'),
+
         # Execution
         position_adjustment_threshold=0.001,
 

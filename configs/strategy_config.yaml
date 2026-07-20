@@ -58,6 +58,13 @@ strategy:
     rsi_extreme_threshold_upper: 75
     rsi_extreme_threshold_lower: 25
     rsi_extreme_multiplier: 0.7
+
+    # Phase 0 safety (env-overridable via main_live.py)
+    risk_per_trade_pct: 0.01        # Risk 1% of live equity per trade (SL-distance based sizing)
+    max_position_leverage: 2.0      # Max position notional = 2x live equity
+    daily_loss_limit_pct: 0.03      # Halt new trades after -3% daily loss
+    max_consecutive_losses: 5       # Pause trading after 5 consecutive losing closes
+    loss_pause_hours: 24            # Pause duration when a kill-switch triggers
     
     # Stop Loss & Take Profit (自动止损止盈)
     enable_auto_sl_tp: true  # 启用自动止损止盈
