@@ -353,9 +353,20 @@ BINANCE_API_KEY=your_binance_api_key_here
 BINANCE_API_SECRET=your_binance_api_secret_here
 
 # ========================================
-# AI SERVICE
+# AI SERVICE (LLM provider)
 # ========================================
+# Active provider via LLM_* (takes precedence over legacy DEEPSEEK_*).
+# Kimi K3 / Moonshot AI example (note: kimi-k3 requires temperature=1):
+LLM_API_KEY=your_llm_api_key_here
+LLM_MODEL=kimi-k3
+LLM_BASE_URL=https://api.moonshot.cn/v1
+LLM_TEMPERATURE=1.0
+
+# DeepSeek rollback (used automatically when LLM_API_KEY is unset):
 DEEPSEEK_API_KEY=your_deepseek_api_key_here
+# LLM_MODEL=deepseek-v4-pro
+# LLM_BASE_URL=https://api.deepseek.com
+# LLM_TEMPERATURE=0.1
 
 # ========================================
 # TRADING PARAMETERS

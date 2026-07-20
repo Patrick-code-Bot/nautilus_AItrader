@@ -66,6 +66,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     deepseek_model: str = "deepseek-v4-pro"
     deepseek_temperature: float = 0.1
     deepseek_max_retries: int = 2
+    deepseek_base_url: str = "https://api.deepseek.com"  # OpenAI-compatible endpoint (Kimi: https://api.moonshot.cn/v1)
 
     # Sentiment
     sentiment_enabled: bool = True
@@ -305,7 +306,11 @@ class DeepSeekAIStrategy(Strategy):
         )
 
         # DeepSeek AI analyzer
-        api_key = config.deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
+        api_key = (
+            config.deepseek_api_key
+            or os.getenv('LLM_API_KEY')
+            or os.getenv('DEEPSEEK_API_KEY')
+        )
         if not api_key:
             raise ValueError("DeepSeek API key not provided")
 
@@ -314,6 +319,7 @@ class DeepSeekAIStrategy(Strategy):
             model=config.deepseek_model,
             temperature=config.deepseek_temperature,
             max_retries=config.deepseek_max_retries,
+            base_url=config.deepseek_base_url,
             nautilus_logger=self.log,
         )
         

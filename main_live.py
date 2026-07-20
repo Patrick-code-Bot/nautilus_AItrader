@@ -90,10 +90,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     DeepSeekAIStrategyConfig
         Strategy configuration
     """
-    # Get API keys
-    deepseek_api_key = get_env_str('DEEPSEEK_API_KEY', '')
+    # Get API keys (LLM_* takes precedence over legacy DEEPSEEK_* names)
+    deepseek_api_key = get_env_str('LLM_API_KEY', '') or get_env_str('DEEPSEEK_API_KEY', '')
     if not deepseek_api_key:
-        raise ValueError("DEEPSEEK_API_KEY not found in environment variables")
+        raise ValueError("LLM_API_KEY (or DEEPSEEK_API_KEY) not found in environment variables")
 
     # Load YAML config
     yaml_config = load_yaml_config()
@@ -163,11 +163,12 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         bb_period=10 if timeframe == '1m' else 20,
         bb_std=2.0,
 
-        # AI
+        # AI (LLM provider: Kimi/Moonshot, DeepSeek, or any OpenAI-compatible API)
         deepseek_api_key=deepseek_api_key,
-        deepseek_model="deepseek-v4-pro",
-        deepseek_temperature=0.1,
+        deepseek_model=get_env_str('LLM_MODEL', get_env_str('DEEPSEEK_MODEL', 'deepseek-v4-pro')),
+        deepseek_temperature=get_env_float('LLM_TEMPERATURE', get_env_str('DEEPSEEK_TEMPERATURE', '0.1')),
         deepseek_max_retries=2,
+        deepseek_base_url=get_env_str('LLM_BASE_URL', get_env_str('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')),
 
         # Sentiment
         sentiment_enabled=True,
