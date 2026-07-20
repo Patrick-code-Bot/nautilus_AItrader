@@ -527,13 +527,16 @@ class DeepSeekAIStrategy(Strategy):
             symbol = symbol_str.split('-')[0]
 
             # Convert bar type to Binance interval
+            # NOTE: check longer timeframes first - "15-MINUTE" contains "5-MINUTE"
             bar_type_str = str(self.bar_type)
-            if '1-MINUTE' in bar_type_str:
-                interval = '1m'
+            if '15-MINUTE' in bar_type_str:
+                interval = '15m'
+            elif '30-MINUTE' in bar_type_str:
+                interval = '30m'
             elif '5-MINUTE' in bar_type_str:
                 interval = '5m'
-            elif '15-MINUTE' in bar_type_str:
-                interval = '15m'
+            elif '1-MINUTE' in bar_type_str:
+                interval = '1m'
             elif '1-HOUR' in bar_type_str:
                 interval = '1h'
             elif '4-HOUR' in bar_type_str:
