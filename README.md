@@ -388,6 +388,14 @@ TRAILING_USE_ATR=true               # ATR-based trailing stop
 TRAILING_ACTIVATION_ATR=1.0         # Activate trailing at +1 x ATR profit
 TRAILING_DISTANCE_ATR=1.0           # Trail 1 x ATR behind the extreme price
 
+# Phase 2: signal measurement & regime filter
+SIGNAL_ONLY_MODE=false              # true = log signals to logs/signal_log.jsonl WITHOUT trading
+REGIME_FILTER_ENABLED=true          # Only trade with the higher-timeframe trend
+REGIME_TIMEFRAME=4h                 # Kline interval for regime classification
+REGIME_EMA_FAST=20                  # Fast EMA for regime
+REGIME_EMA_SLOW=50                  # Slow EMA for regime
+REGIME_FLAT_THRESHOLD_PCT=0.002     # |EMA_fast-EMA_slow|/price below this = flat/chop
+
 # ========================================
 # TELEGRAM (Optional)
 # ========================================

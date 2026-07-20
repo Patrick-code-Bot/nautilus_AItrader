@@ -50,6 +50,31 @@ tail -f logs/trader.log | grep --line-buffered "Current Price:"
 tail -f logs/trader.log | grep --line-buffered "EMULATED"
 ```
 
+## Signal Calibration (Phase 2)
+
+### score_signals.py
+Scores the quality of DeepSeek's signals against realized price paths. The
+strategy writes one JSONL record per evaluated signal (including HOLDs and
+skipped trades) to `logs/signal_log.jsonl`; this tool replays each BUY/SELL
+signal's bracket (SL vs TP, first hit wins) on real klines and reports
+win rate, expectancy in R, and profit factor — overall, per confidence
+level, per side, and split by regime alignment.
+
+**Usage:**
+```bash
+# collect data first (shadow mode, no orders placed):
+SIGNAL_ONLY_MODE=true python main_live.py
+
+# after a few weeks (100+ signals), score the dataset:
+python tools/score_signals.py
+python tools/score_signals.py --max-bars 192   # 48h window instead of 24h
+```
+
+**Reading the verdict:**
+- `avgR > 0` with n >= 30 (aim for 100+) suggests the signal has real edge
+- HIGH should outperform MEDIUM/LOW if "confidence" means anything
+- regime-aligned should beat counter-regime if the 4h filter adds value
+
 ## Notes
 
 - Emulated orders are managed by NautilusTrader's OrderEmulator

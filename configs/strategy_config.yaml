@@ -71,6 +71,14 @@ strategy:
     use_atr_exits: true             # ATR-based SL/TP (falls back to S/R then 2% if ATR unavailable)
     sl_atr_multiplier: 1.5          # Stop loss = 1.5 x ATR from entry
     tp_atr_multiplier: 3.0          # Take profit = 3.0 x ATR from entry (2:1 payoff)
+
+    # Phase 2: signal measurement & higher-timeframe regime filter
+    signal_only_mode: false         # true = log signals to logs/signal_log.jsonl WITHOUT executing
+    regime_filter_enabled: true     # Only trade with the higher-timeframe trend; sit out chop
+    regime_timeframe: "4h"          # Kline interval for regime classification
+    regime_ema_fast: 20
+    regime_ema_slow: 50
+    regime_flat_threshold_pct: 0.002  # |EMA_fast-EMA_slow|/price below this = flat/chop
     
     # Stop Loss & Take Profit (自动止损止盈)
     enable_auto_sl_tp: true  # 启用自动止损止盈

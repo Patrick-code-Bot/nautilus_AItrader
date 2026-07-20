@@ -203,6 +203,14 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         trailing_activation_atr=get_env_float('TRAILING_ACTIVATION_ATR', '1.0'),
         trailing_distance_atr=get_env_float('TRAILING_DISTANCE_ATR', '1.0'),
 
+        # Phase 2: signal measurement & regime filter
+        signal_only_mode=get_env_str('SIGNAL_ONLY_MODE', 'false').lower() == 'true',
+        regime_filter_enabled=get_env_str('REGIME_FILTER_ENABLED', 'true').lower() == 'true',
+        regime_timeframe=get_env_str('REGIME_TIMEFRAME', '4h'),
+        regime_ema_fast=get_env_int('REGIME_EMA_FAST', '20'),
+        regime_ema_slow=get_env_int('REGIME_EMA_SLOW', '50'),
+        regime_flat_threshold_pct=get_env_float('REGIME_FLAT_THRESHOLD_PCT', '0.002'),
+
         # Execution
         position_adjustment_threshold=0.001,
 

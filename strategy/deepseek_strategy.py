@@ -143,6 +143,16 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     trailing_activation_atr: float = 1.0  # Activate trailing at +1 x ATR profit (1R)
     trailing_distance_atr: float = 1.0  # Trail 1 x ATR behind the extreme price
 
+    # Phase 2: signal measurement (shadow mode) & higher-timeframe regime filter
+    signal_only_mode: bool = False  # Log every evaluated signal WITHOUT executing (calibration dataset)
+    signal_log_file: str = "logs/signal_log.jsonl"  # JSONL signal records for tools/score_signals.py
+    regime_filter_enabled: bool = True  # Only trade with the higher-timeframe trend; sit out chop
+    regime_timeframe: str = "4h"  # Binance kline interval used for regime classification
+    regime_ema_fast: int = 20
+    regime_ema_slow: int = 50
+    regime_flat_threshold_pct: float = 0.002  # |EMA_fast-EMA_slow|/price below this = flat/chop
+    regime_cache_ttl_sec: int = 1800  # How long a regime classification stays cached
+
     # Timing
     timer_interval_sec: int = 900
 
@@ -232,6 +242,17 @@ class DeepSeekAIStrategy(Strategy):
         # Format: {instrument_id: {"entry_price": float, "sl_distance": float,
         #   "side": str (LONG/SHORT), "original_quantity": float, "levels_done": [int]}}
         self.partial_tp_state: Dict[str, Dict[str, Any]] = {}
+
+        # Phase 2: signal measurement & regime filter
+        self.signal_only_mode = config.signal_only_mode
+        self.signal_log_file = config.signal_log_file
+        self.regime_filter_enabled = config.regime_filter_enabled
+        self.regime_timeframe = config.regime_timeframe
+        self.regime_ema_fast = config.regime_ema_fast
+        self.regime_ema_slow = config.regime_ema_slow
+        self.regime_flat_threshold_pct = config.regime_flat_threshold_pct
+        self.regime_cache_ttl_sec = config.regime_cache_ttl_sec
+        self._regime_cache: Dict[str, Any] = {"value": None, "ts": 0.0}
         
         # Track trailing stop state for each position
         self.trailing_stop_state: Dict[str, Dict[str, Any]] = {}
@@ -1028,6 +1049,116 @@ class DeepSeekAIStrategy(Strategy):
         except Exception as e:
             self.log.warning(f"⚠️ Failed to cancel disaster stop: {e}")
 
+    # ===== Phase 2: signal measurement & regime filter =====
+
+    def _log_signal_record(
+        self,
+        signal_data: Dict[str, Any],
+        price_data: Dict[str, Any],
+        technical_data: Dict[str, Any],
+        current_position: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Append one JSONL record per evaluated signal.
+
+        This is the calibration dataset consumed by tools/score_signals.py:
+        every cycle's signal is recorded with the exact SL/TP the strategy
+        would have used, so signal quality can be measured offline against
+        realized price paths — including cycles where no trade was taken.
+        """
+        try:
+            price = float(price_data['price'])
+            signal = signal_data.get('signal', 'HOLD')
+            if signal in ('BUY', 'SELL'):
+                side = 'long' if signal == 'BUY' else 'short'
+                sl_price = self._calculate_stop_loss_price(side, price)
+                tp_price = self._calculate_take_profit_price(
+                    side, price, signal_data.get('confidence', 'MEDIUM')
+                )
+            else:
+                sl_price = None
+                tp_price = None
+
+            record = {
+                "ts": self.clock.utc_now().isoformat(),
+                "signal": signal,
+                "confidence": signal_data.get('confidence', 'LOW'),
+                "price": price,
+                "atr": self._get_current_atr(),
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "regime": self._get_regime(),
+                "rsi": technical_data.get('rsi'),
+                "overall_trend": technical_data.get('overall_trend'),
+                "macd_histogram": technical_data.get('macd_histogram'),
+                "bb_position": technical_data.get('bb_position'),
+                "volume_ratio": technical_data.get('volume_ratio'),
+                "has_position": current_position is not None,
+                "position_side": current_position.get('side') if current_position else None,
+                "signal_only": self.signal_only_mode,
+                "reason": str(signal_data.get('reason', ''))[:300],
+            }
+
+            directory = os.path.dirname(self.signal_log_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self.signal_log_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            self.log.warning(f"⚠️ Failed to write signal record: {e}")
+
+    def _get_regime(self) -> str:
+        """Cached higher-timeframe regime: 'up', 'down', 'flat' or 'unknown'."""
+        import time
+        now = time.monotonic()
+        if (
+            self._regime_cache["value"] is not None
+            and now - self._regime_cache["ts"] < self.regime_cache_ttl_sec
+        ):
+            return self._regime_cache["value"]
+        regime = self._fetch_regime()
+        self._regime_cache = {"value": regime, "ts": now}
+        return regime
+
+    def _fetch_regime(self) -> str:
+        """Classify the higher-timeframe trend from Binance klines (EMA cross)."""
+        try:
+            import requests
+            symbol = str(self.instrument_id).split('-')[0]
+            response = requests.get(
+                "https://fapi.binance.com/fapi/v1/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": self.regime_timeframe,
+                    "limit": 60,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            closes = [float(k[4]) for k in response.json()]
+            if len(closes) < self.regime_ema_slow + 1:
+                return "unknown"
+
+            ema_fast = self._ema(closes, self.regime_ema_fast)
+            ema_slow = self._ema(closes, self.regime_ema_slow)
+            spread_pct = (ema_fast - ema_slow) / closes[-1]
+
+            if abs(spread_pct) < self.regime_flat_threshold_pct:
+                return "flat"
+            return "up" if spread_pct > 0 else "down"
+        except Exception as e:
+            self.log.warning(f"⚠️ Regime fetch failed: {e}")
+            return "unknown"
+
+    @staticmethod
+    def _ema(values: List[float], period: int) -> float:
+        """Exponential moving average over a price series."""
+        k = 2.0 / (period + 1)
+        ema = values[0]
+        for value in values[1:]:
+            ema = value * k + ema * (1 - k)
+        return ema
+
     def _execute_trade(
         self,
         signal_data: Dict[str, Any],
@@ -1054,15 +1185,23 @@ class DeepSeekAIStrategy(Strategy):
             self.log.info("⏸️ Trading is paused - skipping signal execution")
             return
 
-        # Phase 0 kill-switches (daily loss limit, loss streaks, anti-churn)
-        if not self._check_risk_guards():
-            return
-        
         # Store signal and technical data for SL/TP calculation
         self.latest_signal_data = signal_data
         self.latest_technical_data = technical_data
         self.latest_price_data = price_data
-        
+
+        # Phase 2: record every evaluated signal for offline calibration
+        self._log_signal_record(signal_data, price_data, technical_data, current_position)
+
+        # Phase 2: shadow mode - measure signal quality without executing
+        if self.signal_only_mode:
+            self.log.info("📝 Signal-only mode: signal recorded, execution disabled")
+            return
+
+        # Phase 0 kill-switches (daily loss limit, loss streaks, anti-churn)
+        if not self._check_risk_guards():
+            return
+
         signal = signal_data['signal']
         confidence = signal_data['confidence']
 
@@ -1081,6 +1220,20 @@ class DeepSeekAIStrategy(Strategy):
         if signal == 'HOLD':
             self.log.info("📊 Signal: HOLD - No action taken")
             return
+
+        # Phase 2: higher-timeframe regime gate (trade with the trend, sit out chop)
+        if self.regime_filter_enabled:
+            regime = self._get_regime()
+            if regime == "flat":
+                self.log.info("🧭 Regime filter: higher timeframe is flat/choppy - no trades")
+                return
+            if regime == "up" and signal == 'SELL':
+                self.log.info("🧭 Regime filter: 4h uptrend - SELL blocked")
+                return
+            if regime == "down" and signal == 'BUY':
+                self.log.info("🧭 Regime filter: 4h downtrend - BUY blocked")
+                return
+            # "unknown" -> fail-open so data issues never block trading
 
         # Calculate target position size
         target_quantity = self._calculate_position_size(
