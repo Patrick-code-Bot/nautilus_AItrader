@@ -379,6 +379,15 @@ MAX_CONSECUTIVE_LOSSES=5            # Pause trading after N consecutive losing c
 LOSS_PAUSE_HOURS=24                 # Pause duration when a kill-switch triggers
 MAX_CONSECUTIVE_SAME_SIGNAL=5       # Block churn after N identical consecutive signals
 
+# Phase 1: ATR-based exits (2:1 reward:risk structure)
+ATR_PERIOD=14                       # ATR period
+USE_ATR_EXITS=true                  # ATR-based SL/TP (false = legacy S/R + confidence % TP)
+SL_ATR_MULTIPLIER=1.5               # Stop loss = 1.5 x ATR from entry
+TP_ATR_MULTIPLIER=3.0               # Take profit = 3.0 x ATR from entry (2:1 payoff)
+TRAILING_USE_ATR=true               # ATR-based trailing stop
+TRAILING_ACTIVATION_ATR=1.0         # Activate trailing at +1 x ATR profit
+TRAILING_DISTANCE_ATR=1.0           # Trail 1 x ATR behind the extreme price
+
 # ========================================
 # TELEGRAM (Optional)
 # ========================================

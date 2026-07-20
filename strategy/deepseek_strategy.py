@@ -104,9 +104,10 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     
     # Partial Take Profit
     enable_partial_tp: bool = True
+    # Levels in R multiples (R = entry-to-stop distance). When reached, a
+    # reduce-only market order closes position_pct of the ORIGINAL quantity.
     partial_tp_levels: Tuple[Dict[str, float], ...] = (
-        {"profit_pct": 0.02, "position_pct": 0.5},
-        {"profit_pct": 0.04, "position_pct": 0.5},
+        {"r_multiple": 1.0, "position_pct": 0.5},
     )
     
     # Telegram Notifications
@@ -132,6 +133,15 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     disaster_stop_enabled: bool = True  # Native exchange-side catastrophic stop (survives restarts)
     disaster_stop_min_pct: float = 0.015  # Minimum distance of the disaster stop from entry
     risk_state_file: str = "logs/risk_state.json"  # Persisted kill-switch state (survives restarts)
+
+    # Phase 1: ATR-based exits (fix reward:risk asymmetry)
+    atr_period: int = 14
+    use_atr_exits: bool = True  # ATR-based SL/TP; falls back to S/R then 2% when ATR unavailable
+    sl_atr_multiplier: float = 1.5  # Stop loss = 1.5 x ATR from entry
+    tp_atr_multiplier: float = 3.0  # Take profit = 3 x ATR from entry (2:1 payoff)
+    trailing_use_atr: bool = True  # ATR-based trailing; falls back to pct when ATR unavailable
+    trailing_activation_atr: float = 1.0  # Activate trailing at +1 x ATR profit (1R)
+    trailing_distance_atr: float = 1.0  # Trail 1 x ATR behind the extreme price
 
     # Timing
     timer_interval_sec: int = 900
@@ -207,6 +217,21 @@ class DeepSeekAIStrategy(Strategy):
         self.trailing_activation_pct = config.trailing_activation_pct
         self.trailing_distance_pct = config.trailing_distance_pct
         self.trailing_update_threshold_pct = config.trailing_update_threshold_pct
+
+        # Phase 1: ATR-based exits & trailing
+        self.use_atr_exits = config.use_atr_exits
+        self.sl_atr_multiplier = config.sl_atr_multiplier
+        self.tp_atr_multiplier = config.tp_atr_multiplier
+        self.trailing_use_atr = config.trailing_use_atr
+        self.trailing_activation_atr = config.trailing_activation_atr
+        self.trailing_distance_atr = config.trailing_distance_atr
+
+        # Partial Take Profit (implemented in Phase 1, R-multiple based)
+        self.enable_partial_tp = config.enable_partial_tp
+        self.partial_tp_levels = config.partial_tp_levels
+        # Format: {instrument_id: {"entry_price": float, "sl_distance": float,
+        #   "side": str (LONG/SHORT), "original_quantity": float, "levels_done": [int]}}
+        self.partial_tp_state: Dict[str, Dict[str, Any]] = {}
         
         # Track trailing stop state for each position
         self.trailing_stop_state: Dict[str, Dict[str, Any]] = {}
@@ -255,6 +280,7 @@ class DeepSeekAIStrategy(Strategy):
             macd_slow=config.macd_slow,
             bb_period=config.bb_period,
             bb_std=config.bb_std,
+            atr_period=config.atr_period,
         )
 
         # DeepSeek AI analyzer
@@ -709,6 +735,10 @@ class DeepSeekAIStrategy(Strategy):
         if self.enable_trailing_stop:
             self._update_trailing_stops(price_data['price'])
 
+        # Partial take-profit maintenance: execute R-multiple levels
+        if self.enable_partial_tp:
+            self._check_partial_take_profits(price_data['price'])
+
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""
         bars = self.indicator_manager.recent_bars
@@ -775,13 +805,24 @@ class DeepSeekAIStrategy(Strategy):
             self.log.warning(f"⚠️ Could not read live account balance: {e}")
         return float(self.equity)
 
+    def _get_current_atr(self) -> float:
+        """Current ATR value from the latest technical data (0 if unavailable)."""
+        technical = self.latest_technical_data or {}
+        return float(technical.get('atr', 0.0) or 0.0)
+
     def _calculate_stop_loss_price(self, side: str, entry_price: float) -> float:
         """
         Calculate stop-loss price for a position side ('long'/'short').
 
-        Uses support/resistance levels when enabled and available,
-        otherwise a default 2% stop.
+        Priority: ATR-based (sl_atr_multiplier x ATR) when use_atr_exits and
+        ATR is available, then support/resistance, then a default 2% stop.
         """
+        atr = self._get_current_atr()
+        if self.use_atr_exits and atr > 0:
+            if side == 'long':
+                return entry_price - self.sl_atr_multiplier * atr
+            return entry_price + self.sl_atr_multiplier * atr
+
         technical = self.latest_technical_data or {}
         support = technical.get('support', 0.0)
         resistance = technical.get('resistance', 0.0)
@@ -794,6 +835,25 @@ class DeepSeekAIStrategy(Strategy):
             if self.sl_use_support_resistance and resistance > 0:
                 return resistance * (1 + self.sl_buffer_pct)
             return entry_price * 1.02
+
+    def _calculate_take_profit_price(self, side: str, entry_price: float, confidence: str) -> float:
+        """
+        Calculate take-profit price for a position side ('long'/'short').
+
+        ATR-based (tp_atr_multiplier x ATR) when use_atr_exits and ATR is
+        available — with the default 3.0/1.5 multipliers this gives a 2:1
+        reward:risk. Falls back to the confidence-based percentage target.
+        """
+        atr = self._get_current_atr()
+        if self.use_atr_exits and atr > 0:
+            if side == 'long':
+                return entry_price + self.tp_atr_multiplier * atr
+            return entry_price - self.tp_atr_multiplier * atr
+
+        tp_pct = self.tp_pct_config.get(confidence, 0.02)
+        if side == 'long':
+            return entry_price * (1 + tp_pct)
+        return entry_price * (1 - tp_pct)
 
     def _same_signal_run_length(self) -> int:
         """Count trailing consecutive identical AI signals (including latest)."""
@@ -1322,13 +1382,8 @@ class DeepSeekAIStrategy(Strategy):
         else:
             self.log.info(f"📍 Stop loss for SHORT: ${stop_loss_price:,.2f}")
 
-        # Calculate Take Profit price (use first level for bracket order)
-        # Note: Bracket orders support single TP. For multiple TPs, we'll submit additional orders after entry fills
-        tp_pct = self.tp_pct_config.get(confidence, 0.02)
-        if side == OrderSide.BUY:
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
+        # Calculate Take Profit price (ATR-based when enabled, else confidence %)
+        tp_price = self._calculate_take_profit_price(side_str, entry_price, confidence)
 
         # Log SL/TP summary
         self.log.info(
@@ -1384,10 +1439,21 @@ class DeepSeekAIStrategy(Strategy):
                         "activated": False,
                         "side": "LONG" if side == OrderSide.BUY else "SHORT",
                         "quantity": quantity,
+                        "atr": self._get_current_atr(),
                     }
                     self.log.debug(
                         f"📌 Saved SL order ID for trailing stop: {str(sl_order.client_order_id)[:8]}..."
                     )
+
+            # Phase 1: initialize partial take-profit tracking (R-multiple based)
+            if self.enable_partial_tp and self.partial_tp_levels:
+                self.partial_tp_state[instrument_key] = {
+                    "entry_price": entry_price,
+                    "sl_distance": abs(entry_price - stop_loss_price),
+                    "side": "LONG" if side == OrderSide.BUY else "SHORT",
+                    "original_quantity": quantity,
+                    "levels_done": [],
+                }
 
         except Exception as e:
             # Phase 0: never fall back to an unprotected naked entry
@@ -1467,6 +1533,7 @@ class DeepSeekAIStrategy(Strategy):
                     "activated": False,
                     "side": event.side.name,
                     "quantity": float(event.quantity),
+                    "atr": self._get_current_atr(),
                 }
                 self.log.info(
                     f"📊 Trailing stop initialized for {event.side.name} position @ ${entry_price:,.2f}"
@@ -1527,6 +1594,11 @@ class DeepSeekAIStrategy(Strategy):
         if instrument_key in self.trailing_stop_state:
             del self.trailing_stop_state[instrument_key]
             self.log.debug(f"🗑️ Cleared trailing stop state for {instrument_key}")
+
+        # Clear partial take-profit state
+        if instrument_key in self.partial_tp_state:
+            del self.partial_tp_state[instrument_key]
+            self.log.debug(f"🗑️ Cleared partial TP state for {instrument_key}")
         
         # Send Telegram position closed notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
@@ -1619,10 +1691,19 @@ class DeepSeekAIStrategy(Strategy):
             entry_price = state["entry_price"]
             side = state["side"]
             activated = state["activated"]
+
+            # Phase 1: ATR-based activation/distance when available
+            atr = float(state.get("atr") or 0.0)
+            use_atr = self.trailing_use_atr and atr > 0
+            activation_distance = (
+                self.trailing_activation_atr * atr
+                if use_atr else self.trailing_activation_pct * entry_price
+            )
             
             # Calculate profit percentage
             if side == "LONG":
-                profit_pct = (current_price - entry_price) / entry_price
+                profit_distance = current_price - entry_price
+                profit_pct = profit_distance / entry_price
                 
                 # Update highest price
                 if state["highest_price"] is None or current_price > state["highest_price"]:
@@ -1631,7 +1712,7 @@ class DeepSeekAIStrategy(Strategy):
                 highest_price = state["highest_price"]
                 
                 # Check if we should activate trailing stop
-                if not activated and profit_pct >= self.trailing_activation_pct:
+                if not activated and profit_distance >= activation_distance:
                     state["activated"] = True
                     self.log.info(
                         f"🎯 Trailing stop ACTIVATED for LONG @ ${current_price:,.2f} "
@@ -1642,7 +1723,10 @@ class DeepSeekAIStrategy(Strategy):
                 # If activated, check if we should update stop loss
                 if activated:
                     # Calculate new stop loss based on highest price
-                    new_sl_price = highest_price * (1 - self.trailing_distance_pct)
+                    new_sl_price = (
+                        highest_price - self.trailing_distance_atr * atr
+                        if use_atr else highest_price * (1 - self.trailing_distance_pct)
+                    )
                     current_sl_price = state["current_sl_price"]
                     
                     # Only update if new SL is significantly higher than current
@@ -1661,7 +1745,8 @@ class DeepSeekAIStrategy(Strategy):
                         )
             
             elif side == "SHORT":
-                profit_pct = (entry_price - current_price) / entry_price
+                profit_distance = entry_price - current_price
+                profit_pct = profit_distance / entry_price
                 
                 # Update lowest price
                 if state["lowest_price"] is None or current_price < state["lowest_price"]:
@@ -1670,7 +1755,7 @@ class DeepSeekAIStrategy(Strategy):
                 lowest_price = state["lowest_price"]
                 
                 # Check if we should activate trailing stop
-                if not activated and profit_pct >= self.trailing_activation_pct:
+                if not activated and profit_distance >= activation_distance:
                     state["activated"] = True
                     self.log.info(
                         f"🎯 Trailing stop ACTIVATED for SHORT @ ${current_price:,.2f} "
@@ -1681,7 +1766,10 @@ class DeepSeekAIStrategy(Strategy):
                 # If activated, check if we should update stop loss
                 if activated:
                     # Calculate new stop loss based on lowest price
-                    new_sl_price = lowest_price * (1 + self.trailing_distance_pct)
+                    new_sl_price = (
+                        lowest_price + self.trailing_distance_atr * atr
+                        if use_atr else lowest_price * (1 + self.trailing_distance_pct)
+                    )
                     current_sl_price = state["current_sl_price"]
                     
                     # Only update if new SL is significantly lower than current
@@ -1786,7 +1874,81 @@ class DeepSeekAIStrategy(Strategy):
 
         except Exception as e:
             self.log.error(f"❌ Failed to execute trailing stop update: {e}")
-    
+
+    def _check_partial_take_profits(self, current_price: float):
+        """
+        Execute configured partial take-profit levels (in R multiples).
+
+        R is the entry-to-stop distance captured at entry. When price reaches
+        r_multiple x R in profit, a reduce-only market order closes
+        position_pct of the ORIGINAL quantity. Each level fires at most once.
+        """
+        try:
+            instrument_key = str(self.instrument_id)
+            state = self.partial_tp_state.get(instrument_key)
+            if not state:
+                return
+
+            entry_price = state["entry_price"]
+            sl_distance = state["sl_distance"]
+            if sl_distance <= 0:
+                return
+
+            if state["side"] == "LONG":
+                r_now = (current_price - entry_price) / sl_distance
+            else:
+                r_now = (entry_price - current_price) / sl_distance
+
+            for idx, level in enumerate(self.partial_tp_levels):
+                if idx in state["levels_done"]:
+                    continue
+                if r_now < level.get("r_multiple", 1.0):
+                    continue
+
+                qty = math.floor(
+                    state["original_quantity"] * level.get("position_pct", 0.5) * 1000
+                ) / 1000
+                state["levels_done"].append(idx)
+
+                if qty < self.position_config['min_trade_amount']:
+                    self.log.warning(
+                        f"⚠️ Partial TP level {idx + 1} reached ({r_now:.2f}R) but "
+                        f"quantity {qty:.3f} below minimum - skipping"
+                    )
+                    continue
+
+                exit_side = OrderSide.SELL if state["side"] == "LONG" else OrderSide.BUY
+                self._submit_order(side=exit_side, quantity=qty, reduce_only=True)
+
+                # Keep tracked trailing-stop quantity in sync with reduced position
+                if instrument_key in self.trailing_stop_state:
+                    remaining = self.trailing_stop_state[instrument_key]["quantity"] - qty
+                    self.trailing_stop_state[instrument_key]["quantity"] = max(0.0, remaining)
+
+                self.log.info(
+                    f"💰 Partial TP level {idx + 1} hit at {r_now:.2f}R: "
+                    f"closed {qty:.3f} BTC ({level.get('position_pct', 0.5):.0%} of original)"
+                )
+
+                # Telegram notification
+                if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
+                    try:
+                        tp_msg = self.telegram_bot.format_partial_tp_notification({
+                            'level': idx + 1,
+                            'quantity': qty,
+                            'price': current_price,
+                            'profit_pct': (current_price - entry_price) / entry_price
+                                if state["side"] == "LONG"
+                                else (entry_price - current_price) / entry_price,
+                            'remaining_quantity': max(0.0, state["original_quantity"] - qty),
+                        })
+                        self.telegram_bot.send_message_sync(tp_msg)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self.log.error(f"❌ Partial take-profit check failed: {e}")
+
     # ===== Remote Control Methods (for Telegram commands) =====
     
     def handle_telegram_command(self, command: str, args: Dict[str, Any]) -> Dict[str, Any]:

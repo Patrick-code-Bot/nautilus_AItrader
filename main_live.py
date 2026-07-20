@@ -176,7 +176,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         sentiment_timeframe="1m" if timeframe == "1m" else ("5m" if timeframe == "5m" else "15m"),
 
         # Risk
-        min_confidence_to_trade=get_env_str('MIN_CONFIDENCE_TO_TRADE', 'MEDIUM'),
+        min_confidence_to_trade=get_env_str(
+            'MIN_CONFIDENCE_TO_TRADE',
+            strategy_yaml.get('risk', {}).get('min_confidence_to_trade', 'MEDIUM'),
+        ),
         allow_reversals=True,
         require_high_confidence_for_reversal=False,
         rsi_extreme_threshold_upper=75.0,
@@ -190,6 +193,15 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         max_consecutive_losses=get_env_int('MAX_CONSECUTIVE_LOSSES', '5'),
         loss_pause_hours=get_env_float('LOSS_PAUSE_HOURS', '24'),
         max_consecutive_same_signal=get_env_int('MAX_CONSECUTIVE_SAME_SIGNAL', '5'),
+
+        # Phase 1: ATR-based exits & trailing
+        atr_period=get_env_int('ATR_PERIOD', '14'),
+        use_atr_exits=get_env_str('USE_ATR_EXITS', 'true').lower() == 'true',
+        sl_atr_multiplier=get_env_float('SL_ATR_MULTIPLIER', '1.5'),
+        tp_atr_multiplier=get_env_float('TP_ATR_MULTIPLIER', '3.0'),
+        trailing_use_atr=get_env_str('TRAILING_USE_ATR', 'true').lower() == 'true',
+        trailing_activation_atr=get_env_float('TRAILING_ACTIVATION_ATR', '1.0'),
+        trailing_distance_atr=get_env_float('TRAILING_DISTANCE_ATR', '1.0'),
 
         # Execution
         position_adjustment_threshold=0.001,

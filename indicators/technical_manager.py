@@ -36,6 +36,7 @@ class TechnicalIndicatorManager:
         bb_std: float = 2.0,
         volume_ma_period: int = 20,
         support_resistance_lookback: int = 20,
+        atr_period: int = 14,
     ):
         """
         Initialize technical indicator manager.
@@ -62,6 +63,8 @@ class TechnicalIndicatorManager:
             Period for volume moving average
         support_resistance_lookback : int
             Lookback period for support/resistance calculation
+        atr_period : int
+            Period for Average True Range (volatility-based exits)
         """
         # SMA indicators
         self.smas = {period: SimpleMovingAverage(period) for period in sma_periods}
@@ -86,6 +89,9 @@ class TechnicalIndicatorManager:
 
         # Volume MA
         self.volume_sma = SimpleMovingAverage(volume_ma_period)
+
+        # ATR (volatility-based exits)
+        self.atr = AverageTrueRange(atr_period)
 
         # Store recent bars for calculations
         self.recent_bars: List[Bar] = []
@@ -134,6 +140,9 @@ class TechnicalIndicatorManager:
 
         # Update Volume SMA
         self.volume_sma.update_raw(float(bar.volume))
+
+        # Update ATR (needs high, low, close)
+        self.atr.update_raw(float(bar.high), float(bar.low), float(bar.close))
 
     def get_technical_data(self, current_price: float) -> Dict[str, Any]:
         """
@@ -204,6 +213,8 @@ class TechnicalIndicatorManager:
             # Support/Resistance
             "support": support,
             "resistance": resistance,
+            # Volatility
+            "atr": self.atr.value,
             # Trend analysis
             **trend_data,
         }
@@ -292,6 +303,9 @@ class TechnicalIndicatorManager:
             return False
 
         if not self.macd.initialized:
+            return False
+
+        if not self.atr.initialized:
             return False
 
         # Check if we have at least one SMA initialized (for trend analysis)

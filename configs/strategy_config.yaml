@@ -33,6 +33,7 @@ strategy:
     bollinger_std: 2.0
     volume_ma_period: 20      # Standard volume MA period
     support_resistance_lookback: 20  # Standard lookback for S/R levels
+    atr_period: 14            # ATR period for volatility-based exits
 
   # AI configuration
   deepseek:
@@ -51,7 +52,7 @@ strategy:
 
   # Risk management
   risk:
-    min_confidence_to_trade: "MEDIUM"  # LOW, MEDIUM, HIGH
+    min_confidence_to_trade: "HIGH"  # LOW, MEDIUM, HIGH (HIGH = fewer trades, less fee drag)
     allow_reversals: true
     require_high_confidence_for_reversal: false  # Set to true for safer trading
     max_consecutive_same_signal: 5
@@ -65,6 +66,11 @@ strategy:
     daily_loss_limit_pct: 0.03      # Halt new trades after -3% daily loss
     max_consecutive_losses: 5       # Pause trading after 5 consecutive losing closes
     loss_pause_hours: 24            # Pause duration when a kill-switch triggers
+
+    # Phase 1: ATR-based exits (2:1 reward:risk structure)
+    use_atr_exits: true             # ATR-based SL/TP (falls back to S/R then 2% if ATR unavailable)
+    sl_atr_multiplier: 1.5          # Stop loss = 1.5 x ATR from entry
+    tp_atr_multiplier: 3.0          # Take profit = 3.0 x ATR from entry (2:1 payoff)
     
     # Stop Loss & Take Profit (自动止损止盈)
     enable_auto_sl_tp: true  # 启用自动止损止盈
@@ -84,15 +90,17 @@ strategy:
     
     # Trailing Stop Loss (移动止损)
     enable_trailing_stop: true  # 启用移动止损
-    trailing_activation_pct: 0.01  # 激活阈值: 盈利 1% 后启动移动止损
-    trailing_distance_pct: 0.005  # 跟踪距离: 距离当前价 0.5%
+    trailing_use_atr: true  # 使用 ATR 跟踪距离 (false 则使用下方百分比)
+    trailing_activation_atr: 1.0  # 激活阈值: 盈利 1 x ATR (1R) 后启动移动止损
+    trailing_distance_atr: 1.0  # 跟踪距离: 1 x ATR
+    trailing_activation_pct: 0.01  # (fallback) 激活阈值: 盈利 1% 后启动移动止损
+    trailing_distance_pct: 0.005  # (fallback) 跟踪距离: 距离当前价 0.5%
     trailing_update_threshold_pct: 0.002  # 更新阈值: 价格移动 0.2% 才更新止损
     
-    # Partial Take Profit (部分止盈)
+    # Partial Take Profit (部分止盈) — Phase 1: R-multiple based, actually executed
     enable_partial_tp: true  # 启用部分止盈
-    partial_tp_levels:  # 止盈级别配置 (百分比, 仓位比例)
-      - {profit_pct: 0.02, position_pct: 0.5}  # 盈利2%时平50%仓位
-      - {profit_pct: 0.04, position_pct: 0.5}  # 盈利4%时平剩余50%仓位
+    partial_tp_levels:  # 止盈级别 (r_multiple = 入场到止损距离的倍数, position_pct = 平仓比例)
+      - {r_multiple: 1.0, position_pct: 0.5}  # 盈利 1R 时平 50% 仓位, 其余交给移动止损
 
   # Telegram Notifications (Telegram 通知)
   telegram:
