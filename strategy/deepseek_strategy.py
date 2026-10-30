@@ -1,8 +1,13 @@
 """
-DeepSeek AI Strategy for NautilusTrader
+AI Strategy for NautilusTrader
 
-AI-powered cryptocurrency trading strategy using DeepSeek for decision making,
-technical indicators for market analysis, and sentiment data for validation.
+AI-powered cryptocurrency trading strategy using an LLM (Anthropic Claude by
+default; DeepSeek / Kimi / any OpenAI-compatible API as alternatives) for
+decision making, technical indicators for market analysis, and sentiment data
+for validation.
+
+Class names keep the historical ``DeepSeek`` prefix for backwards compatibility
+with existing configs, service files and imports.
 """
 
 import os
@@ -10,6 +15,8 @@ import json
 import math
 import asyncio
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -28,7 +35,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indicators.technical_manager import TechnicalIndicatorManager
-from utils.deepseek_client import DeepSeekAnalyzer
+from utils.llm_client import LLMAnalyzer, resolve_provider
 from utils.sentiment_client import SentimentDataFetcher
 # OCOManager no longer needed - using NautilusTrader's built-in bracket orders
 
@@ -39,6 +46,9 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Instrument
     instrument_id: str
     bar_type: str
+    # Binance USDT-M REST endpoint for historical klines (prefetch + regime filter).
+    # Must match the venue the data/exec clients connect to (live/testnet/demo).
+    binance_rest_base_url: str = "https://fapi.binance.com"
 
     # Capital
     equity: float = 10000.0
@@ -61,12 +71,25 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     bb_period: int = 20
     bb_std: float = 2.0
 
-    # AI configuration
+    # AI configuration (LLM decision layer)
+    # provider: "anthropic" (Claude, default) | "openai" (DeepSeek/Kimi/any OpenAI-compatible) | "auto"
+    llm_provider: str = "auto"
+    llm_api_key: str = ""
+    llm_model: str = ""  # empty -> provider default (claude-sonnet-5-5 / deepseek-v4-pro)
+    llm_base_url: str = ""  # empty -> provider default
+    llm_temperature: float = 0.1  # OpenAI-compatible providers only
+    llm_effort: str = "medium"  # Anthropic only: low | medium | high | xhigh | max
+    llm_max_retries: int = 2
+    llm_timeout_sec: float = 60.0  # bounded: the call blocks the trading event loop
+    llm_max_tokens: int = 1024
+    llm_workspace_id: str = ""  # Anthropic only: wrkspc_... (required for multi-workspace keys)
+
+    # Legacy DeepSeek-era names (still honoured when the llm_* fields are empty)
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-v4-pro"
+    deepseek_model: str = ""
     deepseek_temperature: float = 0.1
     deepseek_max_retries: int = 2
-    deepseek_base_url: str = "https://api.deepseek.com"  # OpenAI-compatible endpoint (Kimi: https://api.moonshot.cn/v1)
+    deepseek_base_url: str = ""
 
     # Sentiment
     sentiment_enabled: bool = True
@@ -130,6 +153,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     daily_loss_limit_pct: float = 0.03  # Halt new trades for the day beyond this daily loss
     max_consecutive_losses: int = 5  # Pause trading after this many consecutive losing closes
     loss_pause_hours: float = 24.0  # Pause duration after kill-switch triggers
+    max_total_drawdown_pct: float = 0.10  # Circuit breaker: halt (until manual reset) once live equity is this far below its peak
     max_consecutive_same_signal: int = 5  # Block churn after this many identical consecutive signals
     disaster_stop_enabled: bool = True  # Native exchange-side catastrophic stop (survives restarts)
     disaster_stop_min_pct: float = 0.015  # Minimum distance of the disaster stop from entry
@@ -143,6 +167,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     trailing_use_atr: bool = True  # ATR-based trailing; falls back to pct when ATR unavailable
     trailing_activation_atr: float = 1.0  # Activate trailing at +1 x ATR profit (1R)
     trailing_distance_atr: float = 1.0  # Trail 1 x ATR behind the extreme price
+    trailing_update_threshold_atr: float = 0.25  # Move the stop only when it improves by >= this x ATR
 
     # Phase 2: signal measurement (shadow mode) & higher-timeframe regime filter
     signal_only_mode: bool = False  # Log every evaluated signal WITHOUT executing (calibration dataset)
@@ -156,6 +181,19 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # Timing
     timer_interval_sec: int = 900
+
+    # Testing aid (paper venues ONLY - main_live.py refuses it on BINANCE_ENV=live):
+    # bypass the LLM for the first `force_signal_cycles` analysis cycles and push
+    # this signal through the real risk guards / sizing / bracket-order path.
+    force_signal: str = ""  # "" | BUY | SELL
+    force_signal_cycles: int = 1
+
+    # Exit management & resilience
+    native_exits: bool = True  # exchange-side SL (STOP_MARKET) + TP (TAKE_PROFIT_MARKET) that survive restarts;
+                               # False = legacy emulated bracket legs (die with the process)
+    position_state_file: str = "logs/position_state.json"  # persisted exit/trailing/partial-TP state
+    heartbeat_file: str = "logs/heartbeat"  # touched on every bar/cycle; container healthchecks read its age
+    llm_async: bool = True  # run LLM + sentiment + regime network calls on a worker thread (keeps the event loop free)
 
 
 class DeepSeekAIStrategy(Strategy):
@@ -180,6 +218,7 @@ class DeepSeekAIStrategy(Strategy):
         # Configuration
         self.instrument_id = InstrumentId.from_str(config.instrument_id)
         self.bar_type = BarType.from_str(config.bar_type)
+        self.binance_rest_base_url = (config.binance_rest_base_url or "https://fapi.binance.com").rstrip('/')
 
         # Position sizing config
         self.equity = config.equity
@@ -236,6 +275,7 @@ class DeepSeekAIStrategy(Strategy):
         self.trailing_use_atr = config.trailing_use_atr
         self.trailing_activation_atr = config.trailing_activation_atr
         self.trailing_distance_atr = config.trailing_distance_atr
+        self.trailing_update_threshold_atr = config.trailing_update_threshold_atr
 
         # Partial Take Profit (implemented in Phase 1, R-multiple based)
         self.enable_partial_tp = config.enable_partial_tp
@@ -275,10 +315,21 @@ class DeepSeekAIStrategy(Strategy):
         self.daily_loss_limit_pct = config.daily_loss_limit_pct
         self.max_consecutive_losses = config.max_consecutive_losses
         self.loss_pause_hours = config.loss_pause_hours
+        self.max_total_drawdown_pct = config.max_total_drawdown_pct
         self.max_consecutive_same_signal = config.max_consecutive_same_signal
         self.disaster_stop_enabled = config.disaster_stop_enabled
         self.disaster_stop_min_pct = config.disaster_stop_min_pct
         self.risk_state_file = config.risk_state_file
+
+        # Exit management & resilience
+        self.native_exits = config.native_exits
+        self.position_state_file = config.position_state_file
+        self.heartbeat_file = config.heartbeat_file
+        self.llm_async = config.llm_async
+        self._pending_entry: Optional[Dict[str, Any]] = None  # context for the fill that arms native exits
+        self._loop = None  # asyncio loop captured in on_start (live mode)
+        self._llm_executor: Optional[ThreadPoolExecutor] = None
+        self._analysis_inflight = False
 
         # Kill-switch state (persisted to risk_state_file, survives restarts)
         self.risk_state: Dict[str, Any] = {
@@ -286,6 +337,8 @@ class DeepSeekAIStrategy(Strategy):
             "paused_until": None,      # ISO timestamp (UTC) while paused
             "day_date": None,          # UTC date of current daily baseline
             "day_start_equity": None,  # Equity at start of UTC day
+            "equity_peak": None,       # High-water mark of live equity (circuit breaker reference)
+            "halted_reason": None,     # Set when the circuit breaker trips; cleared only by a manual reset
         }
 
         # Native disaster-stop orders (exchange-side, survive process restarts)
@@ -305,23 +358,39 @@ class DeepSeekAIStrategy(Strategy):
             atr_period=config.atr_period,
         )
 
-        # DeepSeek AI analyzer
+        # LLM decision layer (Claude by default; DeepSeek/Kimi via OpenAI-compatible API)
         api_key = (
-            config.deepseek_api_key
+            config.llm_api_key
+            or config.deepseek_api_key
+            or os.getenv('ANTHROPIC_API_KEY')
             or os.getenv('LLM_API_KEY')
             or os.getenv('DEEPSEEK_API_KEY')
+            or ''
         )
         if not api_key:
-            raise ValueError("DeepSeek API key not provided")
+            raise ValueError(
+                "LLM API key not provided (set ANTHROPIC_API_KEY, LLM_API_KEY or DEEPSEEK_API_KEY)"
+            )
 
-        self.deepseek = DeepSeekAnalyzer(
+        llm_model = config.llm_model or config.deepseek_model or None
+        llm_base_url = config.llm_base_url or config.deepseek_base_url or None
+        provider = resolve_provider(config.llm_provider, api_key, llm_model, llm_base_url)
+
+        self.deepseek = LLMAnalyzer(
             api_key=api_key,
-            model=config.deepseek_model,
-            temperature=config.deepseek_temperature,
-            max_retries=config.deepseek_max_retries,
-            base_url=config.deepseek_base_url,
+            model=llm_model,
+            temperature=config.llm_temperature,  # OpenAI-compatible providers only
+            base_url=llm_base_url,
+            max_retries=config.llm_max_retries or config.deepseek_max_retries,
+            provider=provider,
+            effort=config.llm_effort,
+            timeout_sec=config.llm_timeout_sec,
+            max_tokens=config.llm_max_tokens,
+            workspace_id=config.llm_workspace_id or os.getenv('ANTHROPIC_WORKSPACE_ID', ''),
             nautilus_logger=self.log,
         )
+        # Readable alias; `self.deepseek` is kept for backwards compatibility
+        self.llm = self.deepseek
         
         # Telegram Bot
         self.telegram_bot = None
@@ -408,6 +477,15 @@ class DeepSeekAIStrategy(Strategy):
         self.is_trading_paused = False
         self.strategy_start_time = None
 
+        # Forced test signal (paper venues only)
+        self.force_signal = (config.force_signal or "").strip().upper()
+        self._force_signal_remaining = int(config.force_signal_cycles) if self.force_signal in ("BUY", "SELL") else 0
+        if self._force_signal_remaining:
+            self.log.warning(
+                f"🧪 FORCE_SIGNAL={self.force_signal} active for {self._force_signal_remaining} cycle(s) - "
+                f"the LLM is bypassed and a synthetic signal is executed (paper venues only)"
+            )
+
         # Sentiment data fetcher
         self.sentiment_enabled = config.sentiment_enabled
         if self.sentiment_enabled:
@@ -455,6 +533,18 @@ class DeepSeekAIStrategy(Strategy):
 
         self.log.info(f"Loaded instrument: {self.instrument.id}")
 
+        # Worker thread for network-bound analysis (LLM, sentiment, regime)
+        if self.llm_async:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
+            if self._loop is not None:
+                self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-analysis")
+                self.log.info("🧵 LLM analysis runs on a worker thread (event loop stays free)")
+            else:
+                self.log.warning("⚠️ No running event loop - LLM analysis will run synchronously")
+
         # Pre-fetch historical bars before subscribing to live data
         self._prefetch_historical_bars(limit=200)
 
@@ -470,9 +560,17 @@ class DeepSeekAIStrategy(Strategy):
         )
 
         self.log.info("Strategy started successfully")
+        self._touch_heartbeat("start")
 
         # Restore persisted kill-switch state (daily baseline, loss streaks, pauses)
         self._load_risk_state()
+
+        # Re-adopt a position left open by a previous process (restart/crash) and
+        # make sure it is protected by exchange-side exits
+        try:
+            self._readopt_open_position()
+        except Exception as e:
+            self.log.error(f"❌ Failed to re-adopt open position: {e}", exc_info=True)
 
         # Record start time for uptime tracking
         from datetime import datetime
@@ -501,10 +599,34 @@ class DeepSeekAIStrategy(Strategy):
 
     def on_stop(self):
         """Actions to be performed on strategy stop."""
-        self.log.info("Stopping DeepSeek AI Strategy...")
+        self.log.info("Stopping AI Strategy...")
 
-        # Cancel any pending orders
-        self.cancel_all_orders(self.instrument_id)
+        if self._llm_executor is not None:
+            self._llm_executor.shutdown(wait=False, cancel_futures=True)
+            self._llm_executor = None
+
+        # Cancel pending ENTRY orders only. Reduce-only protective orders (the
+        # native disaster stop / trailing stop) must stay on the exchange while
+        # a position is open - cancelling them here would leave the position
+        # unprotected across a restart, defeating the purpose of the native stop.
+        try:
+            has_position = bool(self.cache.positions_open(instrument_id=self.instrument_id))
+            if not has_position:
+                self.cancel_all_orders(self.instrument_id)
+            else:
+                kept = 0
+                for order in self.cache.orders_open(instrument_id=self.instrument_id):
+                    if order.is_reduce_only:
+                        kept += 1
+                        continue
+                    self.cancel_order(order)
+                self.log.warning(
+                    f"🛡️ Position still open on stop - keeping {kept} reduce-only "
+                    f"protective order(s) on the exchange"
+                )
+        except Exception as e:
+            self.log.error(f"❌ Error while cancelling orders on stop: {e}")
+            self.cancel_all_orders(self.instrument_id)
 
         # Unsubscribe from data
         self.unsubscribe_bars(self.bar_type)
@@ -553,12 +675,12 @@ class DeepSeekAIStrategy(Strategy):
                 interval = '5m'  # Default fallback
 
             self.log.info(
-                f"📡 Pre-fetching {limit} historical bars from Binance "
+                f"📡 Pre-fetching {limit} historical bars from {self.binance_rest_base_url} "
                 f"(symbol={symbol}, interval={interval})..."
             )
 
             # Binance Futures API endpoint
-            url = "https://fapi.binance.com/fapi/v1/klines"
+            url = f"{self.binance_rest_base_url}/fapi/v1/klines"
             params = {
                 'symbol': symbol,
                 'interval': interval,
@@ -573,7 +695,19 @@ class DeepSeekAIStrategy(Strategy):
                 self.log.warning("⚠️ No bars received from Binance API")
                 return
 
-            self.log.info(f"📊 Received {len(klines)} bars from Binance")
+            # The last kline returned by Binance is the CURRENT, still-forming
+            # candle (close time in the future). Feeding it as a closed bar would
+            # double-count the period once the live bar arrives on close.
+            now_ms = int(self.clock.timestamp_ms())
+            closed_klines = [k for k in klines if int(k[6]) <= now_ms]
+            if len(closed_klines) < len(klines):
+                self.log.info(
+                    f"📊 Received {len(klines)} klines from Binance "
+                    f"(dropped {len(klines) - len(closed_klines)} unfinished candle)"
+                )
+            else:
+                self.log.info(f"📊 Received {len(klines)} bars from Binance")
+            klines = closed_klines
 
             # Convert to NautilusTrader bars and feed to indicators
             bars_fed = 0
@@ -618,6 +752,7 @@ class DeepSeekAIStrategy(Strategy):
             The bar received
         """
         self.bars_received += 1
+        self._touch_heartbeat("bar")
 
         # Update technical indicators
         self.indicator_manager.update(bar)
@@ -634,9 +769,21 @@ class DeepSeekAIStrategy(Strategy):
         Periodic analysis and trading logic.
 
         Called every timer_interval_sec seconds (default: 15 minutes).
+
+        Network-bound work (sentiment fetch, higher-timeframe regime, the LLM
+        call) runs on a worker thread so the trading event loop - which also
+        processes fills, position events and emulated orders - is never blocked
+        for the 5-60 s an LLM round trip can take. The result is handed back to
+        the event loop via `call_soon_threadsafe` and acted on in
+        `_on_analysis_complete`.
         """
         self.log.info("=" * 60)
         self.log.info("Running periodic analysis...")
+        self._touch_heartbeat("timer")
+
+        if self._analysis_inflight:
+            self.log.warning("⏳ Previous analysis still in flight (slow LLM?) - skipping this cycle")
+            return
 
         # Check if indicators are ready
         if not self.indicator_manager.is_initialized():
@@ -663,16 +810,6 @@ class DeepSeekAIStrategy(Strategy):
         kline_data = self.indicator_manager.get_kline_data(count=10)
         self.log.debug(f"Retrieved {len(kline_data)} K-lines for analysis")
 
-        # Get sentiment data
-        sentiment_data = None
-        if self.sentiment_enabled and self.sentiment_fetcher:
-            try:
-                sentiment_data = self.sentiment_fetcher.fetch()
-                if sentiment_data:
-                    self.log.info(self.sentiment_fetcher.format_for_display(sentiment_data))
-            except Exception as e:
-                self.log.warning(f"Failed to fetch sentiment data: {e}")
-
         # Build price data for AI
         price_data = {
             'price': current_price,
@@ -697,70 +834,162 @@ class DeepSeekAIStrategy(Strategy):
                 f"{current_position['quantity']} @ ${current_position['avg_px']:.2f}"
             )
 
-        # Analyze with DeepSeek AI
-        try:
-            import time as _time
-            self.log.info("Calling DeepSeek AI for analysis...")
-            _t0 = _time.monotonic()
-            signal_data = self.deepseek.analyze(
-                price_data=price_data,
-                technical_data=technical_data,
-                sentiment_data=sentiment_data,
-                current_position=current_position,
-            )
-            _elapsed = _time.monotonic() - _t0
+        # Forced test signal (paper venues only) is built on the event-loop thread
+        forced_signal = None
+        if self._force_signal_remaining > 0:
+            self._force_signal_remaining -= 1
+            forced_signal = self._build_forced_signal(price_data)
+
+        ctx = {
+            'price_data': price_data,
+            'technical_data': technical_data,
+            'current_position': current_position,
+            'forced_signal': forced_signal,
+            'regime_needed': self.regime_filter_enabled and self._regime_cache_stale(),
+        }
+
+        if self._llm_executor is not None and self._loop is not None:
+            self._analysis_inflight = True
             self.log.info(
-                f"🤖 Signal: {signal_data['signal']} | "
-                f"Confidence: {signal_data['confidence']} | "
-                f"API time: {_elapsed:.1f}s | "
-                f"Reason: {signal_data['reason']}"
+                f"Calling LLM ({self.llm.provider}/{self.llm.model}) on worker thread..."
+                if forced_signal is None else "🧪 Forced signal - skipping LLM call"
             )
-            
-            # Send Telegram signal notification (only for actionable signals)
-            if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
-                if signal_data['signal'] in ['BUY', 'SELL']:
-                    try:
-                        signal_notification = self.telegram_bot.format_trade_signal({
-                            'signal': signal_data['signal'],
-                            'confidence': signal_data['confidence'],
-                            'price': price_data['price'],
-                            'timestamp': price_data['timestamp'],
-                            'rsi': technical_data.get('rsi', 0),
-                            'macd': technical_data.get('macd', 0),
-                            'support': technical_data.get('support', 0),
-                            'resistance': technical_data.get('resistance', 0),
-                            'reasoning': signal_data['reason'],
-                        })
-                        self.telegram_bot.send_message_sync(signal_notification)
-                    except Exception as e:
-                        self.log.warning(f"Failed to send Telegram signal notification: {e}")
-                        
-        except Exception as e:
-            self.log.error(f"DeepSeek AI analysis failed: {e}", exc_info=True)
-            
-            # Send error notification
+            self._llm_executor.submit(self._analysis_worker, ctx)
+        else:
+            self.log.info(f"Calling LLM ({self.llm.provider}/{self.llm.model}) for analysis...")
+            self._on_analysis_complete(ctx, self._run_analysis(ctx))
+
+    def _run_analysis(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Network-bound part of a cycle: sentiment, regime and the LLM decision.
+
+        Safe to run on a worker thread: touches no NautilusTrader state other
+        than logging. Never raises - errors are returned in the result.
+        """
+        result: Dict[str, Any] = {'sentiment': None, 'regime': None, 'signal': None, 'error': None, 'elapsed': 0.0}
+        try:
+            if self.sentiment_enabled and self.sentiment_fetcher:
+                try:
+                    result['sentiment'] = self.sentiment_fetcher.fetch()
+                except Exception as e:
+                    self.log.warning(f"Failed to fetch sentiment data: {e}")
+
+            if ctx.get('regime_needed'):
+                result['regime'] = self._fetch_regime()
+
+            t0 = time.monotonic()
+            if ctx.get('forced_signal') is not None:
+                result['signal'] = ctx['forced_signal']
+            else:
+                result['signal'] = self.llm.analyze(
+                    price_data=ctx['price_data'],
+                    technical_data=ctx['technical_data'],
+                    sentiment_data=result['sentiment'],
+                    current_position=ctx['current_position'],
+                )
+            result['elapsed'] = time.monotonic() - t0
+        except Exception as e:  # noqa: BLE001 - never let the worker die silently
+            result['error'] = e
+        return result
+
+    def _analysis_worker(self, ctx: Dict[str, Any]) -> None:
+        """Worker-thread entry point: run the analysis, hand the result to the event loop."""
+        result = self._run_analysis(ctx)
+        try:
+            self._loop.call_soon_threadsafe(self._on_analysis_complete, ctx, result)
+        except RuntimeError as e:  # loop closed during shutdown
+            self._analysis_inflight = False
+            self.log.warning(f"⚠️ Could not deliver analysis result to event loop: {e}")
+
+    def _on_analysis_complete(self, ctx: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Event-loop side of a cycle: log, notify, execute and run maintenance."""
+        self._analysis_inflight = False
+        price_data = ctx['price_data']
+        technical_data = ctx['technical_data']
+        current_position = ctx['current_position']
+
+        if result.get('regime') is not None:
+            self._regime_cache = {"value": result['regime'], "ts": time.monotonic()}
+
+        if result.get('sentiment'):
+            try:
+                self.log.info(self.sentiment_fetcher.format_for_display(result['sentiment']))
+            except Exception:
+                pass
+
+        error = result.get('error')
+        if error is not None or result.get('signal') is None:
+            self.log.error(f"LLM analysis failed: {error}")
             if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
                 try:
                     error_msg = self.telegram_bot.format_error_alert({
                         'level': 'ERROR',
-                        'message': f"AI Analysis Failed: {str(e)[:100]}",
-                        'context': 'on_timer'
+                        'message': f"AI Analysis Failed: {str(error)[:100]}",
+                        'context': 'on_timer',
                     })
                     self.telegram_bot.send_message_sync(error_msg)
-                except:
+                except Exception:
                     pass
             return
+
+        signal_data = result['signal']
+        if signal_data.get('forced'):
+            self.log.warning(
+                f"🧪 Using FORCED test signal {signal_data['signal']} "
+                f"({self._force_signal_remaining} forced cycle(s) left) - LLM bypassed"
+            )
+        self.log.info(
+            f"🤖 Signal: {signal_data['signal']} | "
+            f"Confidence: {signal_data['confidence']} | "
+            f"API time: {result.get('elapsed', 0.0):.1f}s"
+            + (" | FALLBACK" if signal_data.get('is_fallback') else "")
+            + f" | Reason: {signal_data['reason']}"
+        )
+
+        # Send Telegram signal notification (only for actionable signals)
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
+            if signal_data['signal'] in ['BUY', 'SELL']:
+                try:
+                    signal_notification = self.telegram_bot.format_trade_signal({
+                        'signal': signal_data['signal'],
+                        'confidence': signal_data['confidence'],
+                        'price': price_data['price'],
+                        'timestamp': price_data['timestamp'],
+                        'rsi': technical_data.get('rsi', 0),
+                        'macd': technical_data.get('macd', 0),
+                        'support': technical_data.get('support', 0),
+                        'resistance': technical_data.get('resistance', 0),
+                        'reasoning': signal_data['reason'],
+                    })
+                    self.telegram_bot.send_message_sync(signal_notification)
+                except Exception as e:
+                    self.log.warning(f"Failed to send Telegram signal notification: {e}")
 
         # Store signal
         self.last_signal = signal_data
 
-        # Execute trade
-        self._execute_trade(signal_data, price_data, technical_data, current_position)
-        
-        # OCO maintenance: cleanup orphan orders and expired groups
-        if self.enable_oco and self.oco_manager:
+        # The analysis ran for several seconds; the position may have changed in
+        # the meantime (e.g. an exchange-side stop filled). Never act on a stale
+        # snapshot: re-read the position and, if it differs from what the LLM
+        # was shown, skip execution for this cycle.
+        fresh_position = self._get_current_position_data()
+        if self._position_snapshot(fresh_position) != self._position_snapshot(current_position):
+            self.log.warning(
+                f"⚠️ Position changed during analysis "
+                f"({self._position_snapshot(current_position)} → {self._position_snapshot(fresh_position)}) "
+                f"- skipping execution this cycle"
+            )
+            self._log_signal_record(signal_data, price_data, technical_data, fresh_position)
+        else:
+            try:
+                self._execute_trade(signal_data, price_data, technical_data, fresh_position)
+            except Exception as e:
+                self.log.error(f"❌ Trade execution failed: {e}", exc_info=True)
+
+        # Safety maintenance: cancel orphan reduce-only orders left behind when flat.
+        if self.enable_oco:
             self._cleanup_oco_orphans()
-        
+
         # Trailing stop maintenance: check and update trailing stops
         if self.enable_trailing_stop:
             self._update_trailing_stops(price_data['price'])
@@ -768,6 +997,29 @@ class DeepSeekAIStrategy(Strategy):
         # Partial take-profit maintenance: execute R-multiple levels
         if self.enable_partial_tp:
             self._check_partial_take_profits(price_data['price'])
+
+    def _build_forced_signal(self, price_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Synthetic HIGH-confidence signal used by FORCE_SIGNAL (paper venues only)."""
+        price = float(price_data['price'])
+        is_buy = self.force_signal == 'BUY'
+        return {
+            "signal": self.force_signal,
+            "confidence": "HIGH",
+            "reason": "FORCED TEST SIGNAL (FORCE_SIGNAL) - not an AI decision; exercising the order path",
+            "stop_loss": price * (0.98 if is_buy else 1.02),
+            "take_profit": price * (1.02 if is_buy else 0.98),
+            "trend_strength": "MODERATE",
+            "risk_assessment": "MEDIUM",
+            "timestamp": self.clock.utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "forced": True,
+        }
+
+    @staticmethod
+    def _position_snapshot(position: Optional[Dict[str, Any]]) -> str:
+        """Compact, comparable description of a position dict ('flat' when None)."""
+        if not position:
+            return "flat"
+        return f"{position.get('side', '?')} {float(position.get('quantity', 0.0)):.3f}"
 
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""
@@ -816,13 +1068,8 @@ class DeepSeekAIStrategy(Strategy):
 
     # ===== Phase 0 safety helpers =====
 
-    def _get_account_equity(self) -> float:
-        """
-        Get live USDT wallet balance from the portfolio.
-
-        Falls back to the configured equity if the live balance
-        is unavailable (e.g. account not yet loaded).
-        """
+    def _get_live_equity(self) -> Optional[float]:
+        """Live USDT wallet balance from the portfolio, or None if unavailable."""
         try:
             account = self.portfolio.account(self.instrument_id.venue)
             if account is not None:
@@ -833,7 +1080,19 @@ class DeepSeekAIStrategy(Strategy):
                         return equity
         except Exception as e:
             self.log.warning(f"⚠️ Could not read live account balance: {e}")
-        return float(self.equity)
+        return None
+
+    def _get_account_equity(self) -> float:
+        """
+        Get live USDT wallet balance from the portfolio.
+
+        Falls back to the configured equity if the live balance
+        is unavailable (e.g. account not yet loaded). Use only for sizing -
+        the daily-loss guard must compare live values against live values
+        (see `_check_risk_guards`).
+        """
+        live = self._get_live_equity()
+        return live if live is not None else float(self.equity)
 
     def _get_current_atr(self) -> float:
         """Current ATR value from the latest technical data (0 if unavailable)."""
@@ -887,7 +1146,7 @@ class DeepSeekAIStrategy(Strategy):
 
     def _same_signal_run_length(self) -> int:
         """Count trailing consecutive identical AI signals (including latest)."""
-        history = getattr(self.deepseek, 'signal_history', [])
+        history = getattr(self.llm, 'signal_history', [])
         if not history:
             return 0
         last = history[-1].get('signal')
@@ -899,13 +1158,31 @@ class DeepSeekAIStrategy(Strategy):
                 break
         return run
 
+    def _state_venue_tag(self) -> str:
+        """Identifies the venue a persisted state file belongs to (REST base = live/testnet/demo)."""
+        return self.binance_rest_base_url
+
     def _load_risk_state(self) -> None:
-        """Load persisted kill-switch state (survives restarts)."""
+        """
+        Load persisted kill-switch state (survives restarts).
+
+        State written on another venue (e.g. a testnet rehearsal before going
+        live) is discarded: its equity peak / baselines would be meaningless
+        here and could trip the circuit breaker immediately.
+        """
         try:
             if os.path.exists(self.risk_state_file):
                 with open(self.risk_state_file, 'r') as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
+                    saved_venue = saved.get("venue")
+                    if saved_venue and saved_venue != self._state_venue_tag():
+                        self.log.warning(
+                            f"⚠️ Risk state file belongs to another venue ({saved_venue}); "
+                            f"starting with fresh kill-switch state for {self._state_venue_tag()}"
+                        )
+                        self._save_risk_state()
+                        return
                     for key in self.risk_state:
                         if key in saved:
                             self.risk_state[key] = saved[key]
@@ -920,7 +1197,7 @@ class DeepSeekAIStrategy(Strategy):
             if directory:
                 os.makedirs(directory, exist_ok=True)
             with open(self.risk_state_file, 'w') as f:
-                json.dump(self.risk_state, f)
+                json.dump({**self.risk_state, "venue": self._state_venue_tag()}, f)
         except Exception as e:
             self.log.warning(f"⚠️ Could not save risk state file: {e}")
 
@@ -943,6 +1220,28 @@ class DeepSeekAIStrategy(Strategy):
             except Exception:
                 pass
 
+    def _trigger_halt(self, reason: str) -> None:
+        """
+        Circuit breaker: stop opening new positions until an operator resets the
+        risk state (delete logs/risk_state.json or start with RESET_RISK_STATE=true).
+        Open positions keep their exchange-side exits.
+        """
+        far_future = self.clock.utc_now().to_pydatetime() + timedelta(days=3650)
+        self.risk_state["paused_until"] = far_future.isoformat()
+        self.risk_state["halted_reason"] = reason
+        self._save_risk_state()
+        self.log.error(f"🛑 CIRCUIT BREAKER - TRADING HALTED: {reason} (manual reset required)")
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
+            try:
+                alert = self.telegram_bot.format_error_alert({
+                    'level': 'HALT',
+                    'message': f"Circuit breaker - trading halted: {reason}"[:200],
+                    'context': 'risk_guard',
+                })
+                self.telegram_bot.send_message_sync(alert)
+            except Exception:
+                pass
+
     def _check_risk_guards(self) -> bool:
         """
         Evaluate kill-switches before any trade execution.
@@ -952,10 +1251,17 @@ class DeepSeekAIStrategy(Strategy):
         now = self.clock.utc_now().to_pydatetime()
         today = now.strftime('%Y-%m-%d')
 
-        # (1) UTC day rollover: reset the daily equity baseline
+        live_equity = self._get_live_equity()
+
+        # (1) UTC day rollover: reset the daily equity baseline (live values only -
+        # never seed the baseline with the static configured equity)
         if self.risk_state.get("day_date") != today:
             self.risk_state["day_date"] = today
-            self.risk_state["day_start_equity"] = self._get_account_equity()
+            self.risk_state["day_start_equity"] = live_equity
+            self._save_risk_state()
+        elif self.risk_state.get("day_start_equity") is None and live_equity is not None:
+            # Baseline was unavailable earlier today; capture it now
+            self.risk_state["day_start_equity"] = live_equity
             self._save_risk_state()
 
         # (2) Active pause?
@@ -963,6 +1269,9 @@ class DeepSeekAIStrategy(Strategy):
         if paused_until_str:
             try:
                 paused_until = datetime.fromisoformat(paused_until_str)
+                if paused_until.tzinfo is None:
+                    # Legacy naive timestamps were written as UTC
+                    paused_until = paused_until.replace(tzinfo=now.tzinfo)
                 if now < paused_until:
                     self.log.warning(
                         f"🛡️ Risk guard: trading paused until {paused_until_str} (UTC)"
@@ -973,14 +1282,35 @@ class DeepSeekAIStrategy(Strategy):
                 self.risk_state["consecutive_losses"] = 0
                 self._save_risk_state()
                 self.log.info("🛡️ Risk guard: pause expired, trading resumed")
-            except ValueError:
+            except (ValueError, TypeError):
                 self.risk_state["paused_until"] = None
+                self._save_risk_state()
 
-        # (3) Daily loss limit vs live equity
+        # (2b) Circuit breaker: total drawdown from the live-equity high-water mark.
+        # Unlike the daily/streak pauses this does NOT expire on its own.
+        if self.risk_state.get("halted_reason"):
+            self.log.warning(f"🛑 Trading halted by circuit breaker: {self.risk_state['halted_reason']}")
+            return False
+        if live_equity is not None and self.max_total_drawdown_pct > 0:
+            peak = self.risk_state.get("equity_peak")
+            if not peak or live_equity > peak:
+                self.risk_state["equity_peak"] = live_equity
+                self._save_risk_state()
+                peak = live_equity
+            drawdown = (peak - live_equity) / peak if peak else 0.0
+            if drawdown >= self.max_total_drawdown_pct:
+                self._trigger_halt(
+                    f"Equity ${live_equity:,.2f} is {drawdown:.1%} below peak ${peak:,.2f} "
+                    f"(limit {self.max_total_drawdown_pct:.0%})"
+                )
+                return False
+
+        # (3) Daily loss limit: live equity vs live baseline only. Comparing a
+        # fallback (configured) equity against a live baseline could trigger a
+        # false 24h pause after a transient balance-read failure.
         start_equity = self.risk_state.get("day_start_equity")
-        if start_equity and start_equity > 0:
-            equity_now = self._get_account_equity()
-            daily_pnl_pct = (equity_now - start_equity) / start_equity
+        if start_equity and start_equity > 0 and live_equity is not None:
+            daily_pnl_pct = (live_equity - start_equity) / start_equity
             if daily_pnl_pct <= -self.daily_loss_limit_pct:
                 self._trigger_pause(
                     f"Daily loss limit hit: {daily_pnl_pct:+.2%} "
@@ -988,14 +1318,18 @@ class DeepSeekAIStrategy(Strategy):
                 )
                 return False
 
-        # (4) Anti-churn: block after too many consecutive identical signals
-        run = self._same_signal_run_length()
-        if run > self.max_consecutive_same_signal:
-            self.log.warning(
-                f"🛡️ Risk guard: {run} consecutive identical signals "
-                f"(max {self.max_consecutive_same_signal}) - blocking churn"
-            )
-            return False
+        # (4) Anti-churn: block after too many consecutive identical actionable
+        # signals (HOLD never trades, so a long HOLD run must not block anything)
+        history = getattr(self.llm, 'signal_history', [])
+        latest_signal = history[-1].get('signal') if history else None
+        if latest_signal in ('BUY', 'SELL'):
+            run = self._same_signal_run_length()
+            if run > self.max_consecutive_same_signal:
+                self.log.warning(
+                    f"🛡️ Risk guard: {run} consecutive identical {latest_signal} signals "
+                    f"(max {self.max_consecutive_same_signal}) - blocking churn"
+                )
+                return False
 
         return True
 
@@ -1036,6 +1370,7 @@ class DeepSeekAIStrategy(Strategy):
                 "order_id": str(order.client_order_id),
                 "price": stop_price,
             }
+            self._save_position_state()
             self.log.info(
                 f"🛡️ Native disaster stop submitted @ ${stop_price:,.2f} "
                 f"({disaster_dist_pct:.2%} from entry, qty {quantity})"
@@ -1105,6 +1440,9 @@ class DeepSeekAIStrategy(Strategy):
                 "has_position": current_position is not None,
                 "position_side": current_position.get('side') if current_position else None,
                 "signal_only": self.signal_only_mode,
+                "forced": bool(signal_data.get('forced', False)),
+                "provider": signal_data.get('provider'),
+                "model": signal_data.get('model'),
                 "reason": str(signal_data.get('reason', ''))[:300],
             }
 
@@ -1116,17 +1454,24 @@ class DeepSeekAIStrategy(Strategy):
         except Exception as e:
             self.log.warning(f"⚠️ Failed to write signal record: {e}")
 
+    def _regime_cache_stale(self) -> bool:
+        """True when the cached regime is missing or older than regime_cache_ttl_sec."""
+        return (
+            self._regime_cache["value"] is None
+            or time.monotonic() - self._regime_cache["ts"] >= self.regime_cache_ttl_sec
+        )
+
     def _get_regime(self) -> str:
-        """Cached higher-timeframe regime: 'up', 'down', 'flat' or 'unknown'."""
-        import time
-        now = time.monotonic()
-        if (
-            self._regime_cache["value"] is not None
-            and now - self._regime_cache["ts"] < self.regime_cache_ttl_sec
-        ):
+        """
+        Cached higher-timeframe regime: 'up', 'down', 'flat' or 'unknown'.
+
+        The cache is normally refreshed by the analysis worker thread; fetching
+        here only happens if that refresh did not run (keeps the loop safe).
+        """
+        if not self._regime_cache_stale():
             return self._regime_cache["value"]
         regime = self._fetch_regime()
-        self._regime_cache = {"value": regime, "ts": now}
+        self._regime_cache = {"value": regime, "ts": time.monotonic()}
         return regime
 
     def _fetch_regime(self) -> str:
@@ -1135,7 +1480,7 @@ class DeepSeekAIStrategy(Strategy):
             import requests
             symbol = str(self.instrument_id).split('-')[0]
             response = requests.get(
-                "https://fapi.binance.com/fapi/v1/klines",
+                f"{self.binance_rest_base_url}/fapi/v1/klines",
                 params={
                     "symbol": symbol,
                     "interval": self.regime_timeframe,
@@ -1423,24 +1768,56 @@ class DeepSeekAIStrategy(Strategy):
 
     def _open_new_position(self, side: str, quantity: float):
         """
-        Open new position using bracket order (entry + SL + TP).
+        Open a new, protected position.
 
-        This method submits a bracket order which automatically includes:
-        - Entry order (MARKET)
-        - Stop Loss order (STOP_MARKET)
-        - Take Profit order(s) (LIMIT)
+        native_exits=True (default): MARKET entry; on the fill `on_position_opened`
+        arms exchange-side STOP_MARKET (SL) and TAKE_PROFIT_MARKET (TP) reduce-only
+        algo orders plus the disaster stop. These live on Binance and survive a
+        process crash/restart, and they trigger on the venue - not on this
+        process' event loop.
 
-        The SL and TP orders are linked with OCO, so when one fills, the others cancel.
+        native_exits=False: legacy emulated bracket (entry + SL + TP managed by
+        the NautilusTrader OrderEmulator inside this process).
         """
         order_side = OrderSide.BUY if side == 'long' else OrderSide.SELL
 
-        # Submit bracket order with SL/TP
-        self._submit_bracket_order(
-            side=order_side,
-            quantity=quantity,
-        )
+        if not self.native_exits:
+            self._submit_bracket_order(side=order_side, quantity=quantity)
+            self.log.info(f"🚀 Opening {side} position: {quantity:.3f} BTC (with emulated bracket SL/TP)")
+            return
 
-        self.log.info(f"🚀 Opening {side} position: {quantity:.3f} BTC (with bracket SL/TP)")
+        if not self.latest_signal_data or not self.latest_technical_data:
+            self.log.error("❌ No signal/technical data available for SL/TP - skipping entry")
+            return
+
+        entry_estimate = float((self.latest_price_data or {}).get('price') or 0.0)
+        if entry_estimate <= 0 and self.indicator_manager.recent_bars:
+            entry_estimate = float(self.indicator_manager.recent_bars[-1].close)
+        if entry_estimate <= 0:
+            self.log.error("❌ Unable to determine entry price estimate - skipping entry")
+            return
+
+        confidence = self.latest_signal_data.get('confidence', 'MEDIUM')
+        sl_estimate = self._calculate_stop_loss_price(side, entry_estimate)
+        tp_estimate = self._calculate_take_profit_price(side, entry_estimate, confidence)
+
+        # Context consumed by on_position_opened when the entry fills
+        self._pending_entry = {
+            'side': 'LONG' if side == 'long' else 'SHORT',
+            'quantity': quantity,
+            'confidence': confidence,
+            'atr': self._get_current_atr(),
+            'est_entry_price': entry_estimate,
+            'est_sl_price': sl_estimate,
+            'est_tp_price': tp_estimate,
+            'ts': self.clock.utc_now().isoformat(),
+        }
+
+        self.log.info(
+            f"🚀 Opening {side} position: {quantity:.3f} BTC (MARKET) - "
+            f"exchange-side SL ~${sl_estimate:,.2f} / TP ~${tp_estimate:,.2f} armed on fill"
+        )
+        self._submit_order(side=order_side, quantity=quantity, reduce_only=False)
 
     def _submit_order(
         self,
@@ -1580,11 +1957,14 @@ class DeepSeekAIStrategy(Strategy):
                 f"   OrderList ID: {bracket_order_list.id}"
             )
 
+            # `instrument_key` is needed by BOTH the trailing-stop and partial-TP
+            # blocks below (previously only defined inside the trailing block ->
+            # NameError when trailing was disabled but partial TP enabled).
+            instrument_key = str(self.instrument_id)
+
             # Save bracket order info for trailing stop
             if self.enable_trailing_stop:
-                instrument_key = str(self.instrument_id)
-
-                # Extract SL order from bracket (it's typically the second order in the list)
+                # Extract SL order from bracket (STOP_MARKET leg)
                 sl_order = None
                 for order in bracket_order_list.orders:
                     if order.order_type == OrderType.STOP_MARKET:
@@ -1602,6 +1982,7 @@ class DeepSeekAIStrategy(Strategy):
                         "side": "LONG" if side == OrderSide.BUY else "SHORT",
                         "quantity": quantity,
                         "atr": self._get_current_atr(),
+                        "native": False,
                     }
                     self.log.debug(
                         f"📌 Saved SL order ID for trailing stop: {str(sl_order.client_order_id)[:8]}..."
@@ -1616,6 +1997,7 @@ class DeepSeekAIStrategy(Strategy):
                     "original_quantity": quantity,
                     "levels_done": [],
                 }
+            self._save_position_state()
 
         except Exception as e:
             # Phase 0: never fall back to an unprotected naked entry
@@ -1667,9 +2049,30 @@ class DeepSeekAIStrategy(Strategy):
             f"{event.quantity} @ {event.avg_px_open}"
         )
 
-        # Update trailing stop state with actual entry price if it exists
-        # (bracket order already initialized it with estimated price)
-        if self.enable_trailing_stop:
+        if self.native_exits:
+            # Arm exchange-side SL/TP from the ACTUAL fill price
+            pending = self._pending_entry or {}
+            self._pending_entry = None
+            side_name = 'LONG' if event.side == PositionSide.LONG else 'SHORT'
+            confidence = pending.get('confidence') or (self.latest_signal_data or {}).get('confidence', 'MEDIUM')
+            if pending and pending.get('side') != side_name:
+                self.log.warning(
+                    f"⚠️ Pending entry side {pending.get('side')} != opened {side_name}; "
+                    f"arming exits from current indicators"
+                )
+            try:
+                self._arm_native_exits(
+                    side=side_name,
+                    quantity=float(event.quantity),
+                    entry_price=float(event.avg_px_open),
+                    confidence=confidence,
+                )
+            except Exception as e:
+                self.log.error(f"❌ Failed to arm exchange-side exits: {e}", exc_info=True)
+
+        # Legacy emulated-bracket bookkeeping: update trailing stop state with the
+        # actual entry price (bracket initialised it with the estimate)
+        if not self.native_exits and self.enable_trailing_stop:
             instrument_key = str(self.instrument_id)
             entry_price = float(event.avg_px_open)
 
@@ -1702,7 +2105,7 @@ class DeepSeekAIStrategy(Strategy):
                 )
 
         # Phase 0: native exchange-side catastrophic stop, independent of the
-        # (emulated) bracket SL. Protects the position if this process dies.
+        # regular SL (defense in depth; placed at 2x the SL distance, min 1.5%).
         if self.disaster_stop_enabled:
             side_str = 'long' if event.side == PositionSide.LONG else 'short'
             self._submit_disaster_stop(
@@ -1710,6 +2113,8 @@ class DeepSeekAIStrategy(Strategy):
                 quantity=float(event.quantity),
                 entry_price=float(event.avg_px_open),
             )
+
+        self._save_position_state()
 
         # Send Telegram position opened notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
@@ -1729,9 +2134,15 @@ class DeepSeekAIStrategy(Strategy):
 
     def on_position_closed(self, event):
         """Handle position closed events."""
-        # PositionOpened event contains position data directly
+        # PositionClosed.side is FLAT - report the direction that was closed
+        entry_side = getattr(event, 'entry', None)
+        direction = (
+            'LONG' if entry_side == OrderSide.BUY
+            else 'SHORT' if entry_side == OrderSide.SELL
+            else event.side.name
+        )
         self.log.info(
-            f"🔴 Position closed: {event.side.name} "
+            f"🔴 Position closed: {direction} "
             f"P&L: {float(event.realized_pnl):.2f} USDT"
         )
 
@@ -1748,8 +2159,11 @@ class DeepSeekAIStrategy(Strategy):
             )
         self._save_risk_state()
 
-        # Cancel the native disaster stop (position is flat now)
+        # Cancel remaining exchange-side exit orders (Binance also auto-cancels
+        # reduce-only orders when flat; this is belt-and-braces and immediate)
+        self._cancel_native_exit_orders()
         self._cancel_disaster_stop()
+        self._pending_entry = None
 
         # Clear trailing stop state
         instrument_key = str(self.instrument_id)
@@ -1761,22 +2175,33 @@ class DeepSeekAIStrategy(Strategy):
         if instrument_key in self.partial_tp_state:
             del self.partial_tp_state[instrument_key]
             self.log.debug(f"🗑️ Cleared partial TP state for {instrument_key}")
+
+        self._clear_position_state()
         
         # Send Telegram position closed notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
             try:
-                # Calculate P&L percentage (approximate)
+                # P&L percentage relative to the notional that was closed
                 pnl = float(event.realized_pnl)
-                # Get rough position size estimate for percentage
-                # Note: This is approximate, actual calculation would require more data
-                pnl_pct = (pnl / 100.0) * 100 if pnl != 0 else 0.0  # Rough estimate
-                
+                entry_px = float(getattr(event, 'avg_px_open', 0.0) or 0.0)
+                closed_qty = float(getattr(event, 'peak_qty', 0.0) or getattr(event, 'quantity', 0.0) or 0.0)
+                notional = entry_px * closed_qty
+                pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
+
+                # PositionClosed.side is FLAT; derive the direction from the entry order side
+                entry_side = getattr(event, 'entry', None)
+                closed_side = (
+                    'LONG' if entry_side == OrderSide.BUY
+                    else 'SHORT' if entry_side == OrderSide.SELL
+                    else event.side.name
+                )
+
                 position_msg = self.telegram_bot.format_position_update({
                     'action': 'CLOSED',
-                    'side': event.side.name,
-                    'quantity': float(event.quantity) if hasattr(event, 'quantity') else 0.0,
-                    'entry_price': float(event.avg_px_open) if hasattr(event, 'avg_px_open') else 0.0,
-                    'current_price': float(event.avg_px_close) if hasattr(event, 'avg_px_close') else 0.0,
+                    'side': closed_side,
+                    'quantity': closed_qty,
+                    'entry_price': entry_px,
+                    'current_price': float(getattr(event, 'avg_px_close', 0.0) or 0.0),
                     'pnl': pnl,
                     'pnl_pct': pnl_pct,
                 })
@@ -1892,8 +2317,12 @@ class DeepSeekAIStrategy(Strategy):
                     current_sl_price = state["current_sl_price"]
                     
                     # Only update if new SL is significantly higher than current
+                    # (ATR-based minimum step when trailing by ATR; the percentage
+                    # threshold is far too coarse relative to an ATR distance)
                     if current_sl_price is None:
                         should_update = True
+                    elif use_atr:
+                        should_update = (new_sl_price - current_sl_price) >= self.trailing_update_threshold_atr * atr
                     else:
                         price_move_pct = (new_sl_price - current_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
@@ -1937,6 +2366,8 @@ class DeepSeekAIStrategy(Strategy):
                     # Only update if new SL is significantly lower than current
                     if current_sl_price is None:
                         should_update = True
+                    elif use_atr:
+                        should_update = (current_sl_price - new_sl_price) >= self.trailing_update_threshold_atr * atr
                     else:
                         price_move_pct = (current_sl_price - new_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
@@ -1997,42 +2428,82 @@ class DeepSeekAIStrategy(Strategy):
                     f"   Distance: {abs((new_sl_price - current_price) / current_price * 100):.2f}%"
                 )
             
-            # Cancel old stop loss order if it exists
+            # Preferred path: MODIFY the existing stop-loss trigger in place.
+            #
+            # The bracket's SL and TP legs are linked with ContingencyType.OUO.
+            # Cancelling the SL (the previous implementation) makes Nautilus'
+            # OrderManager cancel the linked TP as well - the position was left
+            # with no take-profit after the first trailing update. Modifying
+            # the trigger price keeps the bracket (and the TP) intact.
+            old_order = None
             if old_sl_order_id:
                 try:
-                    from nautilus_trader.model.identifiers import ClientOrderId
-                    old_order_id_obj = ClientOrderId(old_sl_order_id)
-                    old_order = self.cache.order(old_order_id_obj)
-                    
-                    if old_order and old_order.is_open:
-                        self.cancel_order(old_order)
-                        self.log.debug(f"🔴 Cancelled old SL order: {old_sl_order_id[:8]}...")
+                    old_order = self.cache.order(ClientOrderId(old_sl_order_id))
                 except Exception as e:
-                    self.log.warning(f"⚠️ Failed to cancel old SL order: {e}")
-            
-            # Submit new stop loss order
+                    self.log.warning(f"⚠️ Could not look up SL order {old_sl_order_id[:8]}...: {e}")
+
+            if state.get("native"):
+                # Exchange-side STOP_MARKET orders cannot be modified on Binance:
+                # submit the replacement FIRST (no unprotected window), then cancel
+                # the old stop. The TP is an independent native order - untouched.
+                exit_side = OrderSide.SELL if side == "LONG" else OrderSide.BUY
+                new_sl_order = self.order_factory.stop_market(
+                    instrument_id=self.instrument_id,
+                    order_side=exit_side,
+                    quantity=self.instrument.make_qty(quantity),
+                    trigger_price=self.instrument.make_price(new_sl_price),
+                    trigger_type=TriggerType.LAST_PRICE,
+                    time_in_force=TimeInForce.GTC,
+                    reduce_only=True,
+                )
+                self.submit_order(new_sl_order)
+                if old_order is not None and old_order.is_open:
+                    self.cancel_order(old_order)
+                state["current_sl_price"] = new_sl_price
+                state["sl_order_id"] = str(new_sl_order.client_order_id)
+                self._save_position_state()
+                self.log.info(
+                    f"✅ Trailing SL replaced on exchange @ ${new_sl_price:,.2f} "
+                    f"(new {state['sl_order_id'][:8]}..., TP untouched)"
+                )
+                return
+
+            if old_order is not None and old_order.is_open:
+                self.modify_order(
+                    old_order,
+                    trigger_price=self.instrument.make_price(new_sl_price),
+                )
+                state["current_sl_price"] = new_sl_price
+                self._save_position_state()
+                self.log.info(
+                    f"✅ Trailing SL trigger modified in place @ ${new_sl_price:,.2f} "
+                    f"(order {old_sl_order_id[:8]}..., TP leg preserved)"
+                )
+                return
+
+            # Fallback (no open SL order known, e.g. after a restart): submit a
+            # fresh native reduce-only STOP_MARKET so the position is protected.
             exit_side = OrderSide.SELL if side == "LONG" else OrderSide.BUY
-            
+
             new_sl_order = self.order_factory.stop_market(
                 instrument_id=self.instrument_id,
                 order_side=exit_side,
                 quantity=self.instrument.make_qty(quantity),
                 trigger_price=self.instrument.make_price(new_sl_price),
                 trigger_type=TriggerType.LAST_PRICE,
-                # Phase 0: native Binance STOP_MARKET (no emulation) so the stop
-                # lives on the exchange and survives process restarts
+                # Native Binance STOP_MARKET (no emulation) so the stop lives on
+                # the exchange and survives process restarts
                 reduce_only=True,
             )
             self.submit_order(new_sl_order)
-            
+
             # Update state
             state["current_sl_price"] = new_sl_price
             state["sl_order_id"] = str(new_sl_order.client_order_id)
+            state["native"] = True
+            self._save_position_state()
 
             self.log.info(f"✅ New trailing SL order submitted @ ${new_sl_price:,.2f}")
-
-            # Note: OCO relationship is handled automatically by NautilusTrader
-            # When the new SL is submitted, it will be linked to the existing TP orders
 
         except Exception as e:
             self.log.error(f"❌ Failed to execute trailing stop update: {e}")
@@ -2085,7 +2556,12 @@ class DeepSeekAIStrategy(Strategy):
                 # Keep tracked trailing-stop quantity in sync with reduced position
                 if instrument_key in self.trailing_stop_state:
                     remaining = self.trailing_stop_state[instrument_key]["quantity"] - qty
-                    self.trailing_stop_state[instrument_key]["quantity"] = max(0.0, remaining)
+                    remaining = max(0.0, math.floor(remaining * 1000) / 1000)
+                    self.trailing_stop_state[instrument_key]["quantity"] = remaining
+                    # Exchange-side exits are sized for the original quantity: resize them
+                    if self.trailing_stop_state[instrument_key].get("native") and remaining > 0:
+                        self._replace_native_exits(remaining)
+                self._save_position_state()
 
                 self.log.info(
                     f"💰 Partial TP level {idx + 1} hit at {r_now:.2f}R: "
@@ -2110,6 +2586,346 @@ class DeepSeekAIStrategy(Strategy):
 
         except Exception as e:
             self.log.error(f"❌ Partial take-profit check failed: {e}")
+
+    # ===== Exchange-side exits, persistence & restart re-adoption =====
+
+    def _order_is_open(self, order_id: Optional[str]) -> bool:
+        """True if the order with this client order id is known to the cache and open."""
+        if not order_id:
+            return False
+        try:
+            order = self.cache.order(ClientOrderId(order_id))
+            return order is not None and order.is_open
+        except Exception:
+            return False
+
+    def _arm_native_exits(
+        self,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        confidence: str,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+    ) -> None:
+        """
+        Place exchange-side reduce-only exits for an open position:
+        STOP_MARKET (stop loss) + TAKE_PROFIT_MARKET (take profit).
+
+        Both are Binance conditional (algo) orders: they trigger on the venue,
+        survive restarts, and Binance auto-cancels the survivor when the
+        position is flat (reduce-only). Also initialises trailing / partial-TP
+        bookkeeping (keyed by instrument) and persists it.
+        """
+        side = side.upper()
+        side_lc = 'long' if side == 'LONG' else 'short'
+        if sl_price is None:
+            sl_price = self._calculate_stop_loss_price(side_lc, entry_price)
+        if tp_price is None:
+            tp_price = self._calculate_take_profit_price(side_lc, entry_price, confidence)
+
+        # Sanity: a stop on the wrong side of the entry would trigger instantly
+        # (Binance -2021). Fall back to a plain 2% / 4% structure.
+        if side == 'LONG' and not (sl_price < entry_price < tp_price):
+            self.log.warning(f"⚠️ Inconsistent LONG exits SL {sl_price:.2f} / entry {entry_price:.2f} / TP {tp_price:.2f} - using 2%/4%")
+            sl_price, tp_price = entry_price * 0.98, entry_price * 1.04
+        if side == 'SHORT' and not (tp_price < entry_price < sl_price):
+            self.log.warning(f"⚠️ Inconsistent SHORT exits TP {tp_price:.2f} / entry {entry_price:.2f} / SL {sl_price:.2f} - using 2%/4%")
+            sl_price, tp_price = entry_price * 1.02, entry_price * 0.96
+
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        qty = self.instrument.make_qty(quantity)
+
+        sl_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id,
+            order_side=exit_side,
+            quantity=qty,
+            trigger_price=self.instrument.make_price(sl_price),
+            trigger_type=TriggerType.LAST_PRICE,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+        )
+        tp_order = self.order_factory.market_if_touched(
+            instrument_id=self.instrument_id,
+            order_side=exit_side,
+            quantity=qty,
+            trigger_price=self.instrument.make_price(tp_price),
+            trigger_type=TriggerType.LAST_PRICE,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+        )
+        self.submit_order(sl_order)
+        self.submit_order(tp_order)
+
+        key = str(self.instrument_id)
+        previous = self.trailing_stop_state.get(key) or {}
+        self.trailing_stop_state[key] = {
+            "entry_price": entry_price,
+            "highest_price": previous.get("highest_price") if side == 'LONG' else None,
+            "lowest_price": previous.get("lowest_price") if side == 'SHORT' else None,
+            "current_sl_price": sl_price,
+            "sl_order_id": str(sl_order.client_order_id),
+            "tp_price": tp_price,
+            "tp_order_id": str(tp_order.client_order_id),
+            "activated": bool(previous.get("activated", False)),
+            "side": side,
+            "quantity": quantity,
+            "atr": previous.get("atr") or self._get_current_atr(),
+            "native": True,
+        }
+        if self.trailing_stop_state[key]["highest_price"] is None and side == 'LONG':
+            self.trailing_stop_state[key]["highest_price"] = entry_price
+        if self.trailing_stop_state[key]["lowest_price"] is None and side == 'SHORT':
+            self.trailing_stop_state[key]["lowest_price"] = entry_price
+
+        if self.enable_partial_tp and self.partial_tp_levels and key not in self.partial_tp_state:
+            self.partial_tp_state[key] = {
+                "entry_price": entry_price,
+                "sl_distance": abs(entry_price - sl_price),
+                "side": side,
+                "original_quantity": quantity,
+                "levels_done": [],
+            }
+
+        self._save_position_state()
+        self.log.info(
+            f"🛡️ Exchange-side exits armed for {side} {quantity:.3f} BTC @ ${entry_price:,.2f}: "
+            f"SL ${sl_price:,.2f} ({(sl_price / entry_price - 1) * 100:+.2f}%) | "
+            f"TP ${tp_price:,.2f} ({(tp_price / entry_price - 1) * 100:+.2f}%)"
+        )
+
+    def _replace_native_exits(self, new_quantity: float) -> None:
+        """Re-issue the exchange-side SL/TP for a smaller quantity (after a partial close)."""
+        key = str(self.instrument_id)
+        state = self.trailing_stop_state.get(key)
+        if not state or not state.get("native"):
+            return
+        if new_quantity < self.position_config['min_trade_amount']:
+            return
+        old_sl, old_tp = state.get("sl_order_id"), state.get("tp_order_id")
+        side = state["side"]
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        qty = self.instrument.make_qty(new_quantity)
+
+        sl_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id, order_side=exit_side, quantity=qty,
+            trigger_price=self.instrument.make_price(state["current_sl_price"]),
+            trigger_type=TriggerType.LAST_PRICE, time_in_force=TimeInForce.GTC, reduce_only=True,
+        )
+        tp_order = self.order_factory.market_if_touched(
+            instrument_id=self.instrument_id, order_side=exit_side, quantity=qty,
+            trigger_price=self.instrument.make_price(state["tp_price"]),
+            trigger_type=TriggerType.LAST_PRICE, time_in_force=TimeInForce.GTC, reduce_only=True,
+        )
+        self.submit_order(sl_order)
+        self.submit_order(tp_order)
+        for old_id in (old_sl, old_tp):
+            if self._order_is_open(old_id):
+                self.cancel_order(self.cache.order(ClientOrderId(old_id)))
+        state["sl_order_id"] = str(sl_order.client_order_id)
+        state["tp_order_id"] = str(tp_order.client_order_id)
+        state["quantity"] = new_quantity
+        self._save_position_state()
+        self.log.info(f"🔁 Exchange-side exits resized to {new_quantity:.3f} BTC")
+
+    def _cancel_native_exit_orders(self) -> None:
+        """Cancel the tracked exchange-side SL/TP orders if they are still open."""
+        state = self.trailing_stop_state.get(str(self.instrument_id)) or {}
+        for label in ("sl_order_id", "tp_order_id"):
+            order_id = state.get(label)
+            if self._order_is_open(order_id):
+                try:
+                    self.cancel_order(self.cache.order(ClientOrderId(order_id)))
+                    self.log.info(f"🗑️ Cancelled {label.split('_')[0].upper()} exit order {order_id[:8]}...")
+                except Exception as e:
+                    self.log.warning(f"⚠️ Failed to cancel {label}: {e}")
+
+    def _touch_heartbeat(self, source: str) -> None:
+        """Write a liveness marker (ISO time + source). Read by tools/healthcheck.py."""
+        if not self.heartbeat_file:
+            return
+        try:
+            directory = os.path.dirname(self.heartbeat_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self.heartbeat_file, 'w') as f:
+                f.write(f"{self.clock.utc_now().isoformat()} {source}\n")
+        except Exception:
+            pass
+
+    def _save_position_state(self) -> None:
+        """Persist exit/trailing/partial-TP bookkeeping so a restart can re-adopt the position."""
+        if not self.position_state_file:
+            return
+        try:
+            directory = os.path.dirname(self.position_state_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            payload = {
+                "instrument_id": str(self.instrument_id),
+                "venue": self._state_venue_tag(),
+                "saved_at": self.clock.utc_now().isoformat(),
+                "trailing_stop_state": self.trailing_stop_state,
+                "partial_tp_state": self.partial_tp_state,
+                "disaster_stop_state": self.disaster_stop_state,
+            }
+            tmp = f"{self.position_state_file}.tmp"
+            with open(tmp, 'w') as f:
+                json.dump(payload, f, indent=1, default=str)
+            os.replace(tmp, self.position_state_file)
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not save position state: {e}")
+
+    def _load_position_state(self) -> Optional[Dict[str, Any]]:
+        if not self.position_state_file or not os.path.exists(self.position_state_file):
+            return None
+        try:
+            with open(self.position_state_file, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            if data.get("venue") and data["venue"] != self._state_venue_tag():
+                self.log.warning(
+                    f"⚠️ Position state file belongs to another venue ({data['venue']}) - ignoring it"
+                )
+                return None
+            return data
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not load position state: {e}")
+            return None
+
+    def _clear_position_state(self) -> None:
+        if not self.position_state_file:
+            return
+        try:
+            if os.path.exists(self.position_state_file):
+                os.remove(self.position_state_file)
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not clear position state file: {e}")
+
+    def _readopt_open_position(self) -> None:
+        """
+        On start: take ownership of a position left open by a previous process.
+
+        * No open position -> drop stale persisted state, cancel orphan
+          reduce-only orders.
+        * Open position -> restore trailing / partial-TP / disaster bookkeeping
+          from disk when it matches, verify each protective order still exists
+          on the venue (by id, else by scanning open reduce-only orders) and
+          re-arm whatever is missing. If the stop or target was breached while
+          offline, close at market immediately.
+        """
+        key = str(self.instrument_id)
+        saved = self._load_position_state()
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+
+        if not positions:
+            if saved:
+                self.log.info("ℹ️ Persisted position state found but no open position (closed while offline) - clearing")
+                self._clear_position_state()
+            self._cleanup_oco_orphans()
+            return
+
+        position = positions[0]
+        side = 'LONG' if position.side == PositionSide.LONG else 'SHORT'
+        qty = float(position.quantity)
+        entry = float(position.avg_px_open)
+        bars = self.indicator_manager.recent_bars
+        price = float(bars[-1].close) if bars else entry
+
+        # ATR-based exit maths needs technical data (none yet right after start)
+        try:
+            self.latest_technical_data = self.indicator_manager.get_technical_data(price)
+        except Exception as e:
+            self.log.warning(f"⚠️ Technical data unavailable during re-adoption: {e}")
+
+        restored = False
+        if saved and (saved.get("trailing_stop_state") or {}).get(key, {}).get("side") == side:
+            self.trailing_stop_state = saved.get("trailing_stop_state") or {}
+            self.partial_tp_state = saved.get("partial_tp_state") or {}
+            self.disaster_stop_state = saved.get("disaster_stop_state") or {}
+            self.trailing_stop_state[key]["quantity"] = qty  # the venue is the truth
+            restored = True
+
+        self.log.warning(
+            f"♻️ Re-adopting open {side} position {qty:.3f} BTC @ ${entry:,.2f} "
+            f"(mark ${price:,.2f}, persisted state {'restored' if restored else 'not available'})"
+        )
+
+        state = self.trailing_stop_state.get(key) or {}
+        confidence = (self.latest_signal_data or {}).get('confidence', 'MEDIUM')
+        side_lc = side.lower()
+        sl_price = state.get("current_sl_price") or self._calculate_stop_loss_price(side_lc, entry)
+        tp_price = state.get("tp_price") or self._calculate_take_profit_price(side_lc, entry, confidence)
+
+        # Breached while offline? Then the position should already be closed - do it now.
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        if (side == 'LONG' and price <= sl_price) or (side == 'SHORT' and price >= sl_price):
+            self.log.error(f"🛑 Stop ${sl_price:,.2f} breached while offline (mark ${price:,.2f}) - closing at market")
+            self._submit_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+        if (side == 'LONG' and price >= tp_price) or (side == 'SHORT' and price <= tp_price):
+            self.log.info(f"🎯 Target ${tp_price:,.2f} reached while offline (mark ${price:,.2f}) - closing at market")
+            self._submit_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+
+        # Which protective orders are still live on the venue?
+        open_ro = [o for o in self.cache.orders_open(instrument_id=self.instrument_id) if o.is_reduce_only]
+        sl_ok = self._order_is_open(state.get("sl_order_id"))
+        tp_ok = self._order_is_open(state.get("tp_order_id"))
+        disaster = self.disaster_stop_state.get(key) or {}
+        disaster_ok = self._order_is_open(disaster.get("order_id"))
+
+        if not (sl_ok and tp_ok and disaster_ok):
+            # Adopt by scanning (ids may differ after reconciliation)
+            known = {state.get("sl_order_id"), state.get("tp_order_id"), disaster.get("order_id")}
+            stops = sorted(
+                [o for o in open_ro if o.order_type == OrderType.STOP_MARKET and str(o.client_order_id) not in known],
+                key=lambda o: abs(float(o.trigger_price) - entry),
+            )
+            mits = [o for o in open_ro if o.order_type == OrderType.MARKET_IF_TOUCHED and str(o.client_order_id) not in known]
+            if not sl_ok and stops:
+                o = stops.pop(0)
+                state["sl_order_id"], state["current_sl_price"], sl_ok = str(o.client_order_id), float(o.trigger_price), True
+                sl_price = state["current_sl_price"]
+            if not disaster_ok and stops:
+                o = stops.pop(-1)
+                self.disaster_stop_state[key] = {"order_id": str(o.client_order_id), "price": float(o.trigger_price)}
+                disaster_ok = True
+            if not tp_ok and mits:
+                o = mits.pop(0)
+                state["tp_order_id"], state["tp_price"], tp_ok = str(o.client_order_id), float(o.trigger_price), True
+                tp_price = state["tp_price"]
+
+        if sl_ok and tp_ok:
+            if key not in self.trailing_stop_state:
+                self.trailing_stop_state[key] = state
+            state.update({"side": side, "quantity": qty, "entry_price": state.get("entry_price", entry), "native": True})
+            state.setdefault("activated", False)
+            state.setdefault("atr", self._get_current_atr())
+            state.setdefault("highest_price", entry if side == 'LONG' else None)
+            state.setdefault("lowest_price", entry if side == 'SHORT' else None)
+            self.log.info(f"✅ Exchange-side exits already live: SL ${sl_price:,.2f} | TP ${tp_price:,.2f}")
+        else:
+            # Re-arm both at the saved prices; cancel any lone survivor first to avoid duplicates
+            for order_id in (state.get("sl_order_id") if sl_ok else None, state.get("tp_order_id") if tp_ok else None):
+                if order_id and self._order_is_open(order_id):
+                    self.cancel_order(self.cache.order(ClientOrderId(order_id)))
+            self.log.warning("🛡️ Protective exits missing after restart - re-arming on the exchange")
+            self._arm_native_exits(side, qty, entry, confidence, sl_price=sl_price, tp_price=tp_price)
+
+        if key not in self.partial_tp_state and self.enable_partial_tp and self.partial_tp_levels:
+            self.partial_tp_state[key] = {
+                "entry_price": entry, "sl_distance": abs(entry - sl_price), "side": side,
+                "original_quantity": qty, "levels_done": [],
+            }
+
+        if not disaster_ok:
+            self.disaster_stop_state.pop(key, None)
+            if self.disaster_stop_enabled:
+                self._submit_disaster_stop(side_lc, qty, entry)
+
+        self._save_position_state()
 
     # ===== Remote Control Methods (for Telegram commands) =====
     
@@ -2189,7 +3005,7 @@ class DeepSeekAIStrategy(Strategy):
                 'is_paused': self.is_trading_paused,
                 'instrument_id': str(self.instrument_id),
                 'current_price': current_price,
-                'equity': self.equity,
+                'equity': self._get_account_equity(),  # live balance when available
                 'unrealized_pnl': unrealized_pnl,
                 'last_signal': last_signal,
                 'last_signal_time': last_signal_time,

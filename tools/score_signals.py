@@ -163,6 +163,7 @@ def main() -> int:
                 r.get("signal") in ("BUY", "SELL")
                 and r.get("sl_price")
                 and r.get("tp_price")
+                and not r.get("forced")  # FORCE_SIGNAL test records are not AI decisions
             ):
                 records.append(r)
 

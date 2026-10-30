@@ -1,24 +1,2 @@
-[Unit]
-Description=DeepSeek AI Trading Strategy
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/nautilus_deepseek
-Environment="PATH=/home/ubuntu/deepseek_venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="AUTO_CONFIRM=true"
-EnvironmentFile=-/home/ubuntu/nautilus_deepseek/.env
-ExecStart=/home/ubuntu/deepseek_venv/bin/python /home/ubuntu/nautilus_deepseek/main_live.py
-
-# 自动重启策略
-Restart=always
-RestartSec=10
-
-# 日志配置
-StandardOutput=append:/home/ubuntu/nautilus_deepseek/logs/trader.log
-StandardError=append:/home/ubuntu/nautilus_deepseek/logs/trader_error.log
-
-[Install]
-WantedBy=multi-user.target
-
+# Superseded by deploy/nautilus-trader.service (installed by deploy/setup_vps.sh).
+# Kept only so existing references do not break.

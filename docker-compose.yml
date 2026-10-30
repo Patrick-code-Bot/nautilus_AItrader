@@ -1,0 +1,32 @@
+# docker compose / Dokploy "Compose" deployment.
+#
+#   docker compose --env-file .env up -d --build
+#
+# Dokploy writes the variables from its Environment tab to a .env file next to
+# this compose file, which `env_file` passes straight into the container.
+services:
+  trader:
+    build: .
+    image: nautilus-aitrader:latest
+    container_name: nautilus-aitrader
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: UTC
+      AUTO_CONFIRM: "true"
+    volumes:
+      - trader_logs:/app/logs      # risk_state.json, position_state.json, signal_log.jsonl, heartbeat, JSONL logs
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # No ports: the bot has no web interface. Telegram is the operator channel.
+
+volumes:
+  trader_logs:

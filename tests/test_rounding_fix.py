@@ -139,70 +139,47 @@ def test_rounding_fix_at_various_prices():
 
 
 def test_actual_strategy_position_sizing():
-    """Test the actual _calculate_position_size method with the fix."""
+    """
+    Test the actual _calculate_position_size method under the Phase 0 policy.
+
+    Phase 0 changed the rule: a trade whose risk-based size lands below the
+    $100 Binance minimum notional is SKIPPED (quantity 0), never inflated to
+    meet the minimum. With adequate equity the floored quantity must still
+    clear the minimum notional.
+    """
     print("\n" + "="*70)
-    print("Testing Actual Strategy Position Sizing")
+    print("Testing Actual Strategy Position Sizing (Phase 0 policy)")
     print("="*70)
 
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
-    import logging
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from helpers import make_strategy_stub
 
-    # Create strategy instance
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.base_usdt = 100.0
-    strategy.equity = 400.0
-    strategy.position_config = {
-        'high_confidence_multiplier': 1.5,
-        'medium_confidence_multiplier': 1.0,
-        'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 0.10,
-        'min_trade_amount': 0.001,
-        'trend_strength_multiplier': 1.2,
-    }
-    strategy.rsi_extreme_upper = 75.0
-    strategy.rsi_extreme_lower = 25.0
-    strategy.rsi_extreme_mult = 0.7
-
-    # Set up logging - create a real logger instance
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger('test_strategy')
-    # Use object.__setattr__ to bypass NautilusTrader's read-only protection
-    object.__setattr__(strategy, 'log', logger)
-
-    # Test at problem price ($90,303)
-    signal_data = {'confidence': 'MEDIUM'}
-    price_data = {'price': 90303.60}
+    price = 90303.60
+    signal_data = {'signal': 'BUY', 'confidence': 'MEDIUM'}
+    price_data = {'price': price}
     technical_data = {
         'overall_trend': '强势下跌',
-        'rsi': 0.36  # Oversold, triggers RSI multiplier
+        'rsi': 36.0,
+        'support': price * 0.99,
+        'resistance': price * 1.01,
     }
-    current_position = None
 
-    print(f"\n📊 Test Scenario:")
-    print(f"   Price: ${price_data['price']:,.2f}")
-    print(f"   Confidence: {signal_data['confidence']}")
-    print(f"   RSI: {technical_data['rsi']} (oversold)")
-    print(f"   Trend: {technical_data['overall_trend']}")
+    # (a) Small account: $400 equity * 1% risk = $4 -> far below $100 notional -> SKIP
+    small = make_strategy_stub(_get_account_equity=lambda: 400.0)
+    qty_small = small._calculate_position_size(signal_data, price_data, technical_data, None)
+    print(f"   $400 equity -> quantity {qty_small:.3f} BTC (expected 0: skipped, never upsized)")
+    assert qty_small == 0.0, "Undersized trade must be skipped, not inflated"
+    assert small.log.contains("Trade skipped")
 
-    # Calculate position size
-    quantity = strategy._calculate_position_size(
-        signal_data, price_data, technical_data, current_position
-    )
+    # (b) Adequate account: result is floored to 0.001 and must clear $100 notional
+    big = make_strategy_stub(_get_account_equity=lambda: 20000.0)
+    qty_big = big._calculate_position_size(signal_data, price_data, technical_data, None)
+    notional = qty_big * price
+    print(f"   $20k equity -> quantity {qty_big:.3f} BTC (${notional:.2f} notional)")
+    assert qty_big > 0 and round(qty_big * 1000) == qty_big * 1000, "Quantity must be floored to 0.001"
+    assert notional >= 100.0, f"Final notional ${notional:.2f} should be >= $100"
 
-    # Calculate final notional
-    final_notional = quantity * price_data['price']
-
-    print(f"\n✅ Result:")
-    print(f"   Quantity: {quantity:.3f} BTC")
-    print(f"   Notional: ${final_notional:.2f}")
-
-    # Assert minimum notional is met
-    assert final_notional >= 100.0, \
-        f"Final notional ${final_notional:.2f} should be >= $100"
-
-    print(f"\n✅ PASS: Actual strategy meets minimum notional requirement")
-    print(f"   ${final_notional:.2f} >= $100.00")
-
+    print("\n✅ PASS: sizing skips undersized trades and never rounds above risk")
     return True
 
 
@@ -211,8 +188,7 @@ def run_all_tests():
     tests = [
         ("Rounding Bug at $90k Price", test_rounding_bug_at_90k_price),
         ("Rounding Fix at Various Prices", test_rounding_fix_at_various_prices),
-        # Note: Actual strategy test removed due to NautilusTrader logger restrictions
-        # The integration tests cover this scenario instead
+        ("Actual Strategy Position Sizing", test_actual_strategy_position_sizing),
     ]
 
     print("\n" + "="*70)

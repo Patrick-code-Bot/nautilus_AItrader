@@ -3,8 +3,9 @@
 # Strategy Monitoring Script
 # 监控策略是否正常运行，检查关键日志
 
-LOG_FILE="/home/ubuntu/nautilus_deepseek/logs/trader.log"
-LATEST_LOG=$(ls -t /home/ubuntu/nautilus_deepseek/logs/trader_*.log 2>/dev/null | head -1)
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="$REPO_DIR/logs/trader.log"
+LATEST_LOG=$(ls -t "$REPO_DIR"/logs/trader_*.log 2>/dev/null | head -1)
 
 echo "=========================================="
 echo "策略运行状态监控"

@@ -4,9 +4,9 @@
 `main_live.py` orchestrates Binance adapters, environment loading, and the Nautilus `TradingNode` that runs `DeepSeekAIStrategy`. Strategy logic sits in `strategy/deepseek_strategy.py`, indicator math in `indicators/technical_manager.py`, integrations (DeepSeek, sentiment, Telegram) in `utils/`, and durable configs in `configs/` (`strategy_config.yaml` for defaults, `.env` for secrets). Operational scripts (`start_trader.sh`, `restart_trader.sh`, `check_strategy_status.sh`, `run_quick_test.py`) live at the repo root, while runtime artifacts are written to `logs/` and can be tailed per session.
 
 ## Build, Test, and Development Commands
-- `python3.10 -m venv venv && source venv/bin/activate` – provision the supported interpreter.
+- `./start_trader.sh --setup` (or `uv venv --python 3.12 .venv && uv pip install -r requirements.txt`) – provision the interpreter; NautilusTrader ≥1.231 requires Python 3.12.
 - `pip install -r requirements.txt` – install NautilusTrader, Binance adapters, and tooling; rerun when requirements change.
-- `python main_live.py` – start the production profile using `.env` overrides; monitor with `tail -f logs/trader*.log`.
+- `python main_live.py` – start using `.env` (BINANCE_ENV selects live/testnet/demo); monitor with `tail -f logs/trader*.log` and `logs/signal_log.jsonl`.
 - `python run_quick_test.py` – launch the 1-minute quick test harness with reduced indicator periods for fast validation loops.
 - `./start_trader.sh | ./restart_trader.sh | ./stop_trader.sh` – manage background sessions with PID bookkeeping instead of manual nohup handling.
 

@@ -4,7 +4,6 @@ Force 1m configuration without environment variables
 """
 import os
 import sys
-import asyncio
 from pathlib import Path
 
 # Set working directory
@@ -31,7 +30,7 @@ from main_live import main
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()  # main() is synchronous (node.run() blocks); asyncio.run() raised ValueError
     except KeyboardInterrupt:
         print("\n\n🛑 Quick test stopped by user")
     except Exception as e:

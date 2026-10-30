@@ -1,10 +1,11 @@
-# NautilusTrader DeepSeek AI Strategy Dependencies
+# NautilusTrader AI Strategy Dependencies
 
 # Core framework
 nautilus_trader>=1.200.0
 
 # AI and API clients
-openai>=1.0.0
+anthropic>=1.0.0     # Claude (default decision layer) - structured outputs need SDK >= 1.0
+openai>=1.0.0        # DeepSeek / Kimi / any OpenAI-compatible provider (optional)
 requests>=2.31.0
 
 # Data processing

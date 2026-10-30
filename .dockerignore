@@ -88,11 +88,13 @@ TIMEFRAME_CHANGE_SUMMARY.md
 test_*.py
 *_test.py
 tests/
+# (tools/ IS copied: preflight, healthcheck, scorer)
 pytest.ini
 .pytest_cache/
 
-# Scripts (not needed in container)
+# Scripts (not needed in container) - except the container entrypoint
 *.sh
+!deploy/docker-entrypoint.sh
 setup.sh
 start_trader.sh
 stop_trader.sh
@@ -132,3 +134,6 @@ htmlcov/
 Dockerfile
 docker-compose.yml
 .dockerignore
+# Replay data / archives
+logs/
+examples/

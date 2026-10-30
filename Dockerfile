@@ -1,80 +1,50 @@
 # ============================================================================
-# Dockerfile for nautilus_AItrader (DeepSeek AI Trading Strategy)
+# nautilus_AItrader - production image (Dokploy / docker compose / plain docker)
 # ============================================================================
-# This creates a production-ready container for running the AI-powered
-# trading strategy on Binance Futures.
-# ============================================================================
+FROM python:3.12-slim
 
-# Stage 1: Base image with Python
-FROM python:3.12-slim AS base
-
-# Metadata
-LABEL maintainer="patrick@project25"
-LABEL description="NautilusTrader DeepSeek AI Strategy on Binance Futures"
-LABEL version="1.0.0"
-
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    AUTO_CONFIRM=true
 
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
+# tzdata/ca-certificates for TLS + correct UTC clock reporting; curl for debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    ca-certificates \
+        ca-certificates curl tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# ============================================================================
-# Stage 2: Dependencies installation
-# ============================================================================
-FROM base AS dependencies
+WORKDIR /app
 
-# Copy requirements file
+# Dependencies first (layer cache). nautilus_trader ships manylinux wheels - no compiler needed.
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Python dependencies
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
-
-# ============================================================================
-# Stage 3: Application
-# ============================================================================
-FROM base AS application
-
-# Copy installed packages from dependencies stage
-COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=dependencies /usr/local/bin /usr/local/bin
-
-# Create necessary directories
-RUN mkdir -p /app/logs /app/data /app/configs
-
-# Copy application code
-COPY main_live.py .
+# Application code
+COPY main_live.py ./
 COPY strategy/ ./strategy/
 COPY utils/ ./utils/
 COPY indicators/ ./indicators/
 COPY configs/ ./configs/
+COPY tools/ ./tools/
+COPY deploy/docker-entrypoint.sh ./deploy/docker-entrypoint.sh
 
-# Create non-root user for security
-RUN useradd -m -u 1000 trader && \
-    chown -R trader:trader /app
-
-# Switch to non-root user
+# Non-root runtime user; /app/logs is the only writable, persisted path
+RUN useradd -m -u 1000 trader \
+    && mkdir -p /app/logs \
+    && chmod +x /app/deploy/docker-entrypoint.sh \
+    && chown -R trader:trader /app
 USER trader
+VOLUME ["/app/logs"]
 
-# Health check (checks if the process is running)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+# Liveness: heartbeat touched on every bar / cycle; stale > 40 min = unhealthy
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+    CMD ["python", "tools/healthcheck.py"]
 
-# Expose port for potential monitoring/metrics (optional)
-# EXPOSE 8080
+# Graceful shutdown: SIGINT -> NautilusTrader stops the node; exchange-side exits stay in place
+STOPSIGNAL SIGINT
 
-# Set default command
-CMD ["python", "main_live.py"]
+ENTRYPOINT ["/app/deploy/docker-entrypoint.sh"]
+CMD ["trade"]

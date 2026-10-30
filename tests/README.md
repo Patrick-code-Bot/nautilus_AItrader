@@ -1,218 +1,102 @@
-# Testing Framework
+# Testing
 
-This directory contains comprehensive tests for the DeepSeek Trading Strategy.
-
-## Quick Start
+Unit tests run offline (no exchange, no LLM network calls) and need only the
+project requirements installed (`nautilus_trader`, `anthropic`, `openai`).
 
 ```bash
-# Activate virtual environment
-source ~/deepseek_venv/bin/activate
+# All offline tests
+python -m pytest tests -q --deselect tests/manual_order_test.py
 
-# Run all tests
+# Individual files also run as plain scripts
+python tests/test_llm_client.py
+python tests/test_bracket_order.py
+python tests/test_strategy_components.py
+python tests/test_rounding_fix.py
 python tests/test_integration_mock.py
 
-# Run specific test
-python tests/test_strategy_components.py
-
-# Manual dry-run (safe testing)
+# Manual Binance connectivity / order test (needs real keys; use --dry-run)
 python tests/manual_order_test.py --dry-run --signal BUY
 ```
 
-## Test Files
+## Files
 
-### 1. `test_strategy_components.py` - Unit Tests
-Tests individual functions in isolation:
-- Position sizing with $100 minimum notional
-- Confidence-based scaling
-- DeepSeek AI response parsing
-- Stop loss/take profit calculations
+| File | Covers |
+|---|---|
+| `helpers.py` | `make_strategy_stub()` - binds the strategy's Python methods onto a plain object so Cython read-only attributes (`cache`, `log`, ...) can be stubbed |
+| `test_llm_client.py` | Claude (Anthropic) request shape incl. `output_config` structured outputs + `effort`, graceful fallback when structured outputs are rejected, response validation (unknown enum values -> HOLD), retry -> fallback, OpenAI-compatible path, JSON extraction |
+| `test_bracket_order.py` | Bracket SL/TP pricing (S/R and ATR), no unprotected entries, partial-TP state without trailing (regression), trailing stop **modifies** the SL in place (regression: cancelling it cancelled the OUO-linked TP), native-stop fallback after restart, SL never moves backwards |
+| `test_strategy_components.py` | Risk-based position sizing (leverage cap, min-notional skip, confidence/RSI modifiers), SL/TP maths, daily-loss guard (live-vs-live only), pause expiry, anti-churn ignores HOLD runs, close-only reversals, pyramiding block |
+| `test_rounding_fix.py` | Quantity flooring to 0.001 and the Phase 0 "skip, never upsize" rule |
+| `test_integration_mock.py` | Mocked Binance -> indicators -> AI -> order-decision flow |
 
-**Run:** `python tests/test_strategy_components.py`
+## Live tests on Binance Futures Testnet (paper money)
 
-### 2. `test_integration_mock.py` - Integration Tests
-Tests full trading flow with mocked APIs:
-- Binance data → Technical analysis → AI analysis → Order creation
-- Order validation (notional, SL, TP)
-- Pre/post hotfix scenarios
+Testnet/demo keys are separate from live keys (create them at
+testnet.binancefuture.com) and are rejected by live Binance with
+`-2015`/`-2008`. Set `BINANCE_ENV=testnet` (or `demo`) in `.env`.
 
-**Run:** `python tests/test_integration_mock.py`
-
-### 3. `manual_order_test.py` - Manual Testing Tool
-For step-by-step debugging and verification:
+**1. Signal-only (no orders), real market data + real Claude calls**
 
 ```bash
-# Dry run (recommended first)
-python tests/manual_order_test.py --dry-run --signal BUY
-
-# Test with testnet (requires setup)
-python tests/manual_order_test.py --testnet --signal BUY
-
-# Live test (DANGEROUS - use with extreme caution)
-python tests/manual_order_test.py --live-danger --signal BUY
+TEST_MODE=true AUTO_CONFIRM=true TIMER_INTERVAL_SEC=60 python main_live.py
 ```
 
-**Options:**
-- `--dry-run`: Simulate without placing orders (safe)
-- `--testnet`: Use Binance Testnet (requires testnet API keys)
-- `--live-danger`: Use live exchange (real money!)
-- `--signal BUY|SELL|HOLD`: Force specific signal for testing
-- `--confidence LOW|MEDIUM|HIGH`: Set confidence level
+Expect in the log: `LLM analyzer ready`, `Pre-fetched 199 bars ... Indicators
+ready: True`, `Subscribed to ...15-MINUTE...`, then one `🤖 Signal:` line per
+cycle without `FALLBACK`, and `Signal-only mode: signal recorded`. Signals are
+appended to `logs/signal_log.jsonl` for `tools/score_signals.py`.
 
-### 4. `test_bracket_order.py` - Existing Tests
-Tests bracket order creation logic.
-
-## Testing Methodology
-
-### Testing Pyramid (Professional Approach)
-
-```
-Level 4: Live Testing        [1%  of tests] - Real money, minimal amounts
-Level 3: Testnet Testing     [9%  of tests] - Real API, fake money
-Level 2: Integration Tests   [20% of tests] - Mocked APIs
-Level 1: Unit Tests          [70% of tests] - Isolated functions
-```
-
-### Your Original Question
-
-> "I want to test step-by-step, set breakpoint after DeepSeek AI analysis,
-> and force a BUY signal to verify order placement. Is this professional?"
-
-**Answer:**
-
-Your approach has merit for debugging, but it's **risky on live exchange**. Here's the professional way:
-
-**✅ GOOD Approach:**
-1. Write unit tests → Test individual functions
-2. Write integration tests → Test component interactions
-3. Use dry-run mode → Step through logic without real orders
-4. Use Binance Testnet → Test with real API, fake money
-5. Use minimal amounts on live exchange → Final verification only
-
-**❌ RISKY Approach:**
-- Setting breakpoints in live trading code
-- Forcing signals on production system
-- Testing directly on live exchange
-- No automated test suite
-
-## Testing Workflow
-
-### For New Features
+**2. Order path (paper orders), forced first signal + restart + manual close**
 
 ```bash
-# 1. Write unit tests
-vim tests/test_my_feature.py
-
-# 2. Run unit tests
-python tests/test_strategy_components.py
-
-# 3. Write integration tests
-vim tests/test_integration_mock.py
-
-# 4. Dry run test
-python tests/manual_order_test.py --dry-run
-
-# 5. Testnet test (if available)
-python tests/manual_order_test.py --testnet
-
-# 6. Live test (minimal amount)
-# Monitor logs closely!
+TEST_MODE=false FORCE_SIGNAL=BUY TIMER_INTERVAL_SEC=60 python main_live.py
 ```
 
-### For Debugging
+`FORCE_SIGNAL` is refused when `BINANCE_ENV=live`. The first cycle pushes a
+synthetic HIGH-confidence signal through the unchanged risk guards, sizing,
+bracket order and disaster-stop code; later cycles use the LLM. Expect
+`Position Sizing`, `Opening long position ... (MARKET)`, `Order filled`,
+`Position opened`, `Exchange-side exits armed`, `Native disaster stop submitted`.
+Then kill the process (Ctrl-C / `./stop_trader.sh`) with the position open and
+start it again WITHOUT `FORCE_SIGNAL`: expect `Re-adopting open LONG position
+... persisted state restored` and `Exchange-side exits already live` with no
+new orders. Closing the position from the Binance UI while the node runs must
+log `Position closed`, `Cancelled SL exit order`, `Cancelled TP exit order`,
+`Cancelled disaster stop`, and remove `logs/position_state.json`.
+
+Verified 2026-10-21 on testnet for all of the above.
+
+Note: Binance Futures now serves conditional orders (STOP_MARKET etc.) through
+its **algo-order API** - they appear under `GET /fapi/v1/openAlgoOrders`, not
+`GET /fapi/v1/openOrders`. Checking only `openOrders` wrongly suggests the
+stop is missing.
+
+Binance does NOT auto-cancel reduce-only algo orders when a position is closed
+by an external order; the strategy cancels them itself (claimed external fills)
+and sweeps any leftovers at startup / each cycle when flat.
+
+**Observed on 2026-10-21 (testnet, claude-opus-5-5, effort=medium):** Claude
+latency 6.7-9.7 s per cycle; sizing on $5,000 paper equity -> 0.118 BTC
+(capped at 2x equity notional); round-trip taker commission ~$8 on ~$9.9k
+notional.
+
+## One-week replay with real LLM decisions (`tools/replay_week.py`)
 
 ```bash
-# Test specific function
-python tests/test_strategy_components.py
-
-# Test full flow with mocked data
-python tests/test_integration_mock.py
-
-# Dry run with forced signal
-python tests/manual_order_test.py --dry-run --signal BUY --confidence HIGH
-
-# Check logs
-tail -f /home/ubuntu/nautilus_deepseek/logs/trader.log
+python tools/replay_week.py decide --days 7 --workers 4 --time-budget 150   # resumable; ~675 LLM calls
+python tools/replay_week.py simulate --equity 500 [--no-regime-filter] [--min-confidence LOW]
 ```
 
-## Binance Testnet Setup
+Feeds the last N days of real 15m klines through `TechnicalIndicatorManager`,
+asks the configured model for a signal at every bar close (same prompt as
+live, but shown no open position), then simulates the live execution rules
+(risk sizing, ATR SL/TP, partial TP, ATR trailing, regime filter, kill-switches,
+taker fees 0.05%/side, 0.02% slippage). Decisions are checkpointed in
+`logs/replay/decisions.jsonl`; results in `logs/replay/result_<equity>.json`.
 
-### 1. Create Testnet Account
-- Visit: https://testnet.binancefuture.com/
-- Register (separate from live account)
-- Get free test USDT
-
-### 2. Generate API Keys
-- API Management → Create API Key
-- Save Key and Secret
-
-### 3. Configure Environment
-Create `.env.testnet`:
-
-```bash
-BINANCE_TESTNET_API_KEY=your_testnet_key
-BINANCE_TESTNET_API_SECRET=your_testnet_secret
-BINANCE_TESTNET_BASE_URL=https://testnet.binancefuture.com
-```
-
-### 4. Install Dependencies
-```bash
-pip install ccxt  # For testnet connection
-```
-
-### 5. Run Testnet Test
-```bash
-export $(cat .env.testnet | xargs)
-python tests/manual_order_test.py --testnet --signal BUY
-```
-
-## Safety Guidelines
-
-### ⚠️ Never Do This
-- ❌ Test on live exchange during development
-- ❌ Force signals in production code
-- ❌ Use large amounts for testing
-- ❌ Skip automated tests
-- ❌ Debug with real money
-
-### ✅ Always Do This
-- ✅ Write unit tests for new features
-- ✅ Use dry-run mode first
-- ✅ Test on Binance Testnet
-- ✅ Use minimum notional on live ($100)
-- ✅ Monitor logs during testing
-- ✅ Set strict risk limits
-
-## Test Results
-
-### Integration Tests (Passed ✅)
-
-```
-Results: 2 passed, 0 failed
-
-Test 1: Full Trading Flow
-- ✓ Mock Binance data generation
-- ✓ Technical indicator calculation
-- ✓ DeepSeek AI response parsing
-- ✓ Position sizing (enforces $100 minimum)
-- ✓ Bracket order creation
-- ✓ Order validation
-
-Test 2: Order Rejection Scenario
-- ✓ Old config ($30) → Would be rejected
-- ✓ New config ($100) → Would be accepted
-- ✓ Hotfix validation
-```
-
-## Documentation
-
-See `/home/ubuntu/nautilus_deepseek/docs/TESTING_GUIDE.md` for comprehensive testing guide.
-
-## Questions?
-
-Your approach to testing (step-by-step with breakpoints and forced signals) is good for **debugging**, but should be done with:
-
-1. **Dry runs** (no real orders) - Use `--dry-run` flag
-2. **Testnet** (real API, fake money) - Use `--testnet` flag
-3. **Minimal amounts** (real money) - Only for final verification
-
-The test framework provides all these options safely!
+Result for 2026-10-15 → 2026-10-22 (claude-opus-5-5, effort medium, 675 decisions,
+0 fallbacks): 95% HOLD, 22 SELL / 9 BUY; with $500: 8 trades, 50% win rate,
+profit factor 0.90, net **-$1.66 (-0.33%)**, fees $7.49, max drawdown 2.6%
+(BTC +2.06% buy-and-hold). Without the regime filter: +$6.28 (+1.26%, 13
+trades, PF 1.25). Eight trades is far too small a sample to claim an edge
+either way; fees were the largest single line item.

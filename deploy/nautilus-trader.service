@@ -1,0 +1,31 @@
+# systemd unit for the AI trading strategy (install with deploy/setup_vps.sh,
+# which substitutes __USER__ and __REPO_DIR__).
+[Unit]
+Description=AI Trading Strategy (NautilusTrader + Claude) - Binance Futures
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__REPO_DIR__
+EnvironmentFile=__REPO_DIR__/.env
+Environment=AUTO_CONFIRM=true
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=__REPO_DIR__/.venv/bin/python __REPO_DIR__/tools/preflight_live.py
+ExecStart=__REPO_DIR__/.venv/bin/python __REPO_DIR__/main_live.py
+# SIGINT -> graceful Nautilus shutdown; exchange-side exits stay in place
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+# Never restart-loop forever on a config error (preflight fails fast)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+StandardOutput=append:__REPO_DIR__/logs/trader.log
+StandardError=append:__REPO_DIR__/logs/trader_error.log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

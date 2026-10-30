@@ -1,7 +1,7 @@
-# DeepSeek AI Strategy Configuration for NautilusTrader
+# AI Strategy Configuration for NautilusTrader (LLM decision layer: Claude by default)
 
 strategy:
-  name: "DeepSeekAIStrategy"
+  name: "DeepSeekAIStrategy"  # class name kept for backwards compatibility
   instrument_id: "BTCUSDT-PERP.BINANCE"
 
   # Bar configuration
@@ -35,12 +35,17 @@ strategy:
     support_resistance_lookback: 20  # Standard lookback for S/R levels
     atr_period: 14            # ATR period for volatility-based exits
 
-  # AI configuration
-  deepseek:
-    model: "deepseek-v4-pro"
-    temperature: 0.1
+  # AI decision layer (defaults; .env LLM_* / ANTHROPIC_API_KEY override these)
+  llm:
+    provider: "anthropic"        # anthropic (Claude, default) | openai (DeepSeek/Kimi/any OpenAI-compatible) | auto
+    model: "claude-sonnet-5-5"   # Claude: claude-sonnet-5-5 (speed/cost balance) | claude-opus-5-5 (strongest)
+    effort: "medium"             # Anthropic only: low | medium | high | xhigh | max
+    temperature: 0.1             # OpenAI-compatible providers only (kimi-k3 requires 1.0)
+    base_url: ""                 # OpenAI-compatible providers only, e.g. https://api.deepseek.com
     max_retries: 2
-    base_url: "https://api.deepseek.com"
+    timeout_sec: 60              # bounded: the LLM call blocks the trading event loop
+    max_tokens: 1024
+    workspace_id: ""             # Anthropic only: wrkspc_... for multi-workspace keys (usually set via .env)
 
   # Sentiment data
   sentiment:
